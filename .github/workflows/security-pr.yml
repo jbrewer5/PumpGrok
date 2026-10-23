@@ -19,7 +19,10 @@
 # the gate never runs on main itself. The dependency job audits the uv.lock export,
 # so pyproject.toml and uv.lock changes are covered on every run.
 #
-# Runners are GitHub-hosted (ubuntu-latest). Self-hosted runners are not used.
+# Every job runs on the Omega CI runner pool ([self-hosted, linux, x64, omega-ci],
+# swcstudiospace/Omega-Prime docs/ci-runners.md), never on GitHub-hosted runners. Pull requests
+# from forks are skipped: fork code never reaches the pool. The pool has no Docker, so Trivy runs
+# as the binary baked into the runner image instead of the Docker-based trivy-action.
 
 name: Security PR Gate
 
@@ -35,7 +38,8 @@ permissions:
 jobs:
   secrets:
     name: Gitleaks (secrets)
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     # security-events: write is declared per job, not at the workflow root. It is needed only
     # by the optional code-scanning upload below.
     permissions:
@@ -88,7 +92,8 @@ jobs:
 
   semgrep:
     name: Semgrep (SAST)
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     permissions:
       contents: read
       security-events: write
@@ -104,7 +109,7 @@ jobs:
       - name: Install Semgrep
         # Pinned (SEC-005): unpinned scanner installs fail the guard in
         # ci/tests/test_security_workflows.py. Verified on PyPI 2026-10-22.
-        run: pip install "semgrep==1.182.1"
+        run: python -m pip install "semgrep==1.182.1"
 
       - name: Semgrep — repo rules + registry security/secrets packs
         # --error makes the exit code depend on findings; --severity ERROR keeps the PR gate to
@@ -142,7 +147,8 @@ jobs:
 
   bandit:
     name: Bandit (Python SAST)
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     permissions:
       contents: read
       security-events: write
@@ -158,7 +164,7 @@ jobs:
       - name: Install Bandit
         # Pinned (SEC-005): unpinned scanner installs fail the guard in
         # ci/tests/test_security_workflows.py. Verified on PyPI 2026-10-22.
-        run: pip install "bandit==1.9.4"
+        run: python -m pip install "bandit==1.9.4"
 
       - name: Bandit baseline — snapshot the base ref's own findings
         # A whole-repo scan fails every PR on findings already present on the base ref. Bandit's
@@ -224,7 +230,8 @@ jobs:
 
   dependencies:
     name: pip-audit / Trivy (SCA)
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     permissions:
       contents: read
       security-events: write
@@ -244,22 +251,25 @@ jobs:
         # the dev group, never an ambient pip install.
         run: |
           set -euo pipefail
-          pip install "uv==0.13.4"
+          python -m pip install "uv==0.13.4"
           uv sync --frozen
           uv export --frozen --no-dev --no-emit-project --format requirements-txt --no-hashes -o req.txt
           uv run pip-audit -r req.txt --strict
 
       - name: Trivy filesystem scan — HIGH+ dependency vulnerabilities
         # ignore-unfixed is deliberately NOT set: a HIGH or CRITICAL finding with no fix released
-        # yet is still a HIGH or CRITICAL finding, and this gate fails on it.
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: sarif
-          output: trivy.sarif
-          severity: HIGH,CRITICAL
-          exit-code: "1"
+        # yet is still a HIGH or CRITICAL finding, and this gate fails on it. Trivy is the binary
+        # in the Omega CI runner image (the pool has no Docker for aquasecurity/trivy-action);
+        # its vulnerability database is downloaded into the job's HOME cache on each run.
+        run: |
+          set -euo pipefail
+          trivy --version
+          trivy fs \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format sarif \
+            --output trivy.sarif \
+            .
 
       - name: Upload SARIF artifact
         if: always()

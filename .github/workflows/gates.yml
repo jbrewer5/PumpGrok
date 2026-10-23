@@ -6,7 +6,9 @@
 # python3 ci/gates or pytest run. The PR tree is data under test (diffs, receipts, paths);
 # the gate implementations are never taken from the PR.
 #
-# Runners are GitHub-hosted (ubuntu-latest). Self-hosted runners are not used.
+# Every job runs on the Omega CI runner pool ([self-hosted, linux, x64, omega-ci],
+# swcstudiospace/Omega-Prime docs/ci-runners.md), never on GitHub-hosted runners. Pull requests
+# from forks are skipped: fork code never reaches the pool.
 
 name: Quality Gates
 
@@ -23,8 +25,8 @@ jobs:
   gates:
     # Pull requests only. A push to main has no head ref, so the acting bot would resolve to
     # "main" and fail attribution before any gate ran.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,7 +55,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install gate dependencies
-        run: pip install pyyaml
+        run: python -m pip install pyyaml
 
       # One-time waivers, decided by the repository owner in session. PR 6: ask gates, then ask
       # rollback. PR 8 (branch gap/v2-closure, same repository only): ask gapgates. G-1, G-2 and
@@ -187,7 +189,8 @@ jobs:
 
   gate-self-test:
     # The gates are only trustworthy if they still block what they claim to block.
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, omega-ci]
     steps:
       - uses: actions/checkout@v4
       - name: Use trusted gate scripts from base ref
@@ -209,7 +212,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv (pinned to the version that wrote uv.lock)
-        run: pip install "uv==0.13.4"
+        run: python -m pip install "uv==0.13.4"
       - name: Install the project so every owning test module collects
         run: uv sync --frozen
       - name: Gate test suite

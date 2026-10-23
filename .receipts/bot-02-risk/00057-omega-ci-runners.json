@@ -1,0 +1,33 @@
+{
+  "task_id": "00057-pumpgrok",
+  "bot": "bot-02-risk",
+  "branch": "bot-02-risk/00057-omega-ci-runners",
+  "approved_by": "bot-00-chief",
+  "approval_note": "Repository owner rule (Ove, 2026-10-24): every CI job runs on the Omega CI runner pool.",
+  "commands": [
+    {
+      "cmd": "uv run pytest ci/tests/ -o addopts= -q",
+      "exit_code": 0,
+      "output_tail": "407 passed in 5.71s"
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The workflow guard tests pass; they pin each job in ci.yml, gates.yml and security-pr.yml to the omega-ci pool, require the same-repository fork guard, and require Trivy to run as the binary with HIGH,CRITICAL and exit code 1",
+      "evidence_command_index": 0
+    }
+  ],
+  "unverified": [
+    "The jobs on the live omega-ci runners: checked by this PR's own CI run, not locally"
+  ],
+  "files_changed": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/gates.yml",
+    ".github/workflows/security-pr.yml",
+    "ci/tests/test_security_workflows.py",
+    ".gitignore",
+    ".receipts/bot-02-risk/00057-omega-ci-runners.json"
+  ],
+  "contract_changes": [],
+  "rollback_plan": "Revert this pull request's merge commit with git revert; the workflows return to the previous runs-on values and the trivy-action step."
+}
