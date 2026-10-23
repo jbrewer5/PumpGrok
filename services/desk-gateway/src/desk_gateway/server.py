@@ -22,10 +22,10 @@ non-negative integer (400) and at most 1 MiB (413).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
 import logging
-import os
 import re
 import secrets
 import threading
@@ -55,7 +55,9 @@ from pumpgrok.core.side_effect import SideEffect
 from pumpgrok.execution import build_adapter
 from pumpgrok.ledger.store import LedgerStore
 from pumpgrok.replay.clock import Clock, WallClock
+from pumpgrok.risk.alert_channel import AlertChannel, build_alert_channel
 from pumpgrok.risk.engine import RiskEngine
+from pumpgrok.risk.killswitch import killswitch_file
 from pumpgrok.tools import build_registry, register_read_tools
 from pumpgrok.tools.desk._memory import MemoryBank
 from pumpgrok.tools.desk.brief import build_brief_tool
@@ -83,13 +85,13 @@ from pumpgrok.tools.portfolio.pnl import build_pnl_tool
 from pumpgrok.tools.risk.check_limits import build_check_limits_tool
 from pumpgrok.tools.risk.drawdown import build_drawdown_tool
 from pumpgrok.tools.risk.halt_status import build_halt_status_tool
-from pumpgrok.tools.risk.kill_switch import build_kill_switch_tool
+from pumpgrok.tools.risk.kill_switch import build_kill_switch_tool, flatten_hook_for
 from pumpgrok.tools.safety.score_report import build_score_report_tool
 
 log = logging.getLogger("desk_gateway")
 
-RPC_ENV_VAR = "DESK_GATEWAY_RPC_ENDPOINTS"
-DEFAULT_RPC_ENDPOINTS = ("https://api.mainnet-beta.solana.com",)
+#: RISK-004: kill sources (env, file, alert channel) are polled on this fixed cycle.
+KILL_POLL_INTERVAL_S = 5.0
 
 
 class _ClosedNotifier(Notifier):
@@ -102,37 +104,52 @@ class _ClosedNotifier(Notifier):
         raise NotYetImplemented("notify.send needs Phase 4 sinks", tool="notify.alert")
 
 
-def rpc_endpoints() -> list[str]:
-    """Ordered RPC endpoints from the environment, with a default fallback."""
-    raw = os.environ.get(RPC_ENV_VAR, "")
-    endpoints = [part.strip() for part in raw.split(",") if part.strip()]
-    return endpoints or list(DEFAULT_RPC_ENDPOINTS)
+class GatewayRefusedError(RuntimeError):
+    """The operator configuration is one the gateway refuses to serve."""
 
 
-def build_gateway_registry(
+def refuse_live(settings: Settings) -> None:
+    """Live mode is refused here exactly as the CLI live gate refuses it: paper only."""
+    if settings.effective_mode != "paper":
+        raise GatewayRefusedError("live mode is refused: the desk gateway serves paper only")
+
+
+def build_gateway_registry(  # noqa: PLR0913 - keyword-only wiring inputs, one call site each
     *,
+    settings: Settings,
     data_dir: Path,
     repo_root: Path,
+    ledger_path: Path,
+    telegram_token: str,
+    alert_channel: AlertChannel | None = None,
     clock: Clock | None = None,
     http_client: httpx.AsyncClient | None = None,
-) -> tuple[ToolRegistry, dict[str, BotManifest]]:
-    """Compose the full 37-tool registry the gateway projects (no tool logic).
+) -> tuple[ToolRegistry, dict[str, BotManifest], RiskEngine]:
+    """Compose the full catalog registry the gateway projects (no tool logic).
 
-    Wiring only: every catalog tool is registered exactly as the root
-    least-privilege harness builds it, so ``registry.find`` enforces the
-    same roster grants over HTTP as in-process. Returns the registry plus
-    the ten seat manifests for ``find``.
+    Every collaborator reads its configuration from the operator ``settings``, loaded by
+    the same path the CLI uses (``PUMPGROK_CONFIG`` and profile overlays), so an overlay
+    reaches the gateway risk budget, limits, adapter, doctor and safety thresholds.
+    Wiring only: every catalog tool is registered exactly as the root least-privilege
+    harness builds it, so ``registry.find`` enforces the same roster grants over HTTP as
+    in-process. Returns the registry plus the ten seat manifests for ``find``.
     """
-
+    refuse_live(settings)
     active_clock = clock if clock is not None else WallClock()
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     reg, _audits = build_registry(clock=active_clock, rng=secrets.SystemRandom())
     client = http_client if http_client is not None else httpx.AsyncClient()
-    rpc = RpcClient(rpc_endpoints(), client, active_clock, secrets.SystemRandom())
-    store = LedgerStore(data_dir / "ledger.sqlite")
-    settings = Settings(mode="paper")
+    rpc = RpcClient(
+        list(settings.rpc.endpoints),
+        client,
+        active_clock,
+        secrets.SystemRandom(),
+        api_key=settings.rpc.api_key,
+    )
+    store = LedgerStore(ledger_path)
     budget = settings.risk
+    latch = killswitch_file(data_dir)
     engine = RiskEngine(
         store=store,
         budget=budget,
@@ -140,7 +157,14 @@ def build_gateway_registry(
         clock=active_clock,
         limits=settings.limits,
         mode="paper",
-        killswitch_path=data_dir / "KILLSWITCH",
+        killswitch_path=latch,
+        alert_channel=(
+            alert_channel
+            if alert_channel is not None
+            else build_alert_channel(
+                token=telegram_token, allowlist=settings.notify.allowlist, state_dir=data_dir
+            )
+        ),
     )
     adapter = build_adapter(
         settings,
@@ -150,10 +174,14 @@ def build_gateway_registry(
         clock=active_clock,
         rng=secrets.SystemRandom(),
     )
+    engine.attach_flatten_hook(
+        flatten_hook_for(store, adapter.inflight_barrier, adapter.close_position)
+    )
     bank = MemoryBank(data_dir / "memory.jsonl")
+    mode = settings.effective_mode
 
     register_read_tools(reg, rpc)
-    reg.register(build_score_report_tool(rpc))
+    reg.register(build_score_report_tool(rpc, settings.safety.thresholds))
     reg.register(build_quote_tool(adapter, active_clock))
     reg.register(build_simulate_tool(adapter, active_clock))
     reg.register(build_place_tool(adapter, lambda: budget, active_clock))
@@ -165,8 +193,8 @@ def build_gateway_registry(
     reg.register(build_pnl_tool(store, active_clock))
     reg.register(build_check_limits_tool(store, budget, active_clock))
     reg.register(build_drawdown_tool(store, budget, active_clock))
-    reg.register(build_halt_status_tool(store, data_dir / "KILLSWITCH", active_clock, "paper"))
-    reg.register(build_kill_switch_tool(store, active_clock, data_dir / "KILLSWITCH"))
+    reg.register(build_halt_status_tool(store, latch, active_clock, mode))
+    reg.register(build_kill_switch_tool(store, active_clock, latch))
     reg.register(build_journal_append_tool(store, active_clock, data_dir / "journal"))
     reg.register(build_render_report_tool(store, active_clock, data_dir / "reports"))
     reg.register(
@@ -175,7 +203,7 @@ def build_gateway_registry(
             active_clock,
         )
     )
-    reg.register(build_brief_tool(store, bank, active_clock, None, "paper"))
+    reg.register(build_brief_tool(store, bank, active_clock, None, mode))
     reg.register(build_docs_search_tool(repo_root, active_clock))
     reg.register(build_memory_retain_tool(bank, active_clock))
     reg.register(build_memory_recall_tool(bank, active_clock))
@@ -183,16 +211,29 @@ def build_gateway_registry(
     reg.register(build_receipt_check_tool(repo_root / "ci" / "gates", repo_root, active_clock))
     reg.register(build_event_emit_tool(store, active_clock, data_dir / "journal"))
     binding_key = load_or_create_binding_key(data_dir)
-    reg.register(
-        build_doctor_tool(
-            Settings(mode="paper"),
-            data_dir / "bindings",
-            binding_key,
-            active_clock,
-        )
-    )
+    reg.register(build_doctor_tool(settings, data_dir / "bindings", binding_key, active_clock))
     manifests = load_bot_manifests(default_contracts_dir())
-    return reg, manifests
+    return reg, manifests, engine
+
+
+async def _poll_kill_sources(engine: RiskEngine, interval_s: float) -> None:
+    """RISK-004: poll the env, file and alert kill sources on a fixed cycle until cancelled.
+
+    A failing cycle is logged and retried on the next tick; only cancellation (shutdown) stops it.
+    """
+    while True:
+        try:
+            await engine.poll_kill_sources()
+        except Exception:
+            log.exception("kill source poll failed; retrying next cycle")
+        await asyncio.sleep(interval_s)
+
+
+async def _cancel_and_wait(task: asyncio.Task[Any]) -> None:
+    """Cancel one task on its own loop and wait for it to finish."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 def _short_from_path(path: str) -> str | None:
@@ -253,7 +294,13 @@ class _Handler(BaseHTTPRequestHandler):
     def _method_not_allowed(self) -> None:
         self._send_json(405, {"error": {"code": "method_not_allowed", "message": "use POST"}})
 
-    do_GET = _method_not_allowed
+    def do_GET(self) -> None:
+        # Liveness only: no tool, seat or ledger detail, and no token required.
+        if self.path.split("?", 1)[0] == "/healthz":
+            self._send_json(200, {"ok": True, "service": "desk-gateway"})
+            return
+        self._method_not_allowed()
+
     do_PUT = _method_not_allowed
     do_DELETE = _method_not_allowed
     do_PATCH = _method_not_allowed
@@ -489,19 +536,31 @@ class _Handler(BaseHTTPRequestHandler):
             return error
         assert output is not None
         dumped = output.model_dump(mode="json")
-        return {
+        # A refused order (exec.place status "rejected") is an error on the wire, never a
+        # success envelope; the refusal reason is the MCP code (TOOL-004).
+        rejected = dumped.get("status") == "rejected"
+        envelope: dict[str, Any] = {
             "content": [{"type": "text", "text": json.dumps(dumped)}],
-            "isError": False,
+            "isError": rejected,
         }
+        if rejected:
+            envelope["code"] = str(dumped.get("reason") or "rejected")
+        return envelope
 
 
 _CALL_TIMEOUT_S = 120.0
+_CLOSE_TIMEOUT_S = 10.0
 
 
-def _start_owner_loop(
+def _start_owner_loop(  # noqa: PLR0913 - keyword-only wiring inputs, one call site
     *,
+    settings: Settings,
     data_dir: Path,
     repo_root: Path,
+    ledger_path: Path,
+    telegram_token: str,
+    alert_channel: AlertChannel | None,
+    kill_poll_interval_s: float,
     clock: Clock,
     http_client: httpx.AsyncClient | None,
 ) -> tuple[Any, dict[str, Any]]:
@@ -518,14 +577,22 @@ def _start_owner_loop(
     def _serve_tools() -> None:
         asyncio.set_event_loop(loop)
         try:
-            cell["registry"], cell["manifests"] = build_gateway_registry(
+            cell["registry"], cell["manifests"], cell["engine"] = build_gateway_registry(
+                settings=settings,
                 data_dir=data_dir,
                 repo_root=repo_root,
+                ledger_path=ledger_path,
+                telegram_token=telegram_token,
+                alert_channel=alert_channel,
                 clock=clock,
                 http_client=http_client,
             )
             names = cell["registry"].names()
             cell["global_map"] = {transport_name(name): name for name in names}
+            # RISK-004: an idle gateway must still read KILL lines, so the poll runs on this loop.
+            cell["kill_poll_task"] = loop.create_task(
+                _poll_kill_sources(cell["engine"], kill_poll_interval_s)
+            )
         except Exception as exc:  # fail fast: never leave ready unset
             cell["error"] = exc
         finally:
@@ -543,17 +610,25 @@ def _start_owner_loop(
     return loop, cell
 
 
-def create_server(
+def create_server(  # noqa: PLR0913 - keyword-only wiring inputs, one call site
     config: GatewayConfig,
     *,
+    settings: Settings,
     clock: Clock | None = None,
     http_client: httpx.AsyncClient | None = None,
+    alert_channel: AlertChannel | None = None,
+    kill_poll_interval_s: float = KILL_POLL_INTERVAL_S,
 ) -> ThreadingHTTPServer:
-    """Bind a threaded JSON-RPC server over an owner-thread registry."""
+    """Bind a threaded JSON-RPC server over an owner-thread registry built from ``settings``."""
     active_clock = clock if clock is not None else WallClock()
     owner_loop, cell = _start_owner_loop(
+        settings=settings,
         data_dir=config.data_dir,
         repo_root=config.repo_root,
+        ledger_path=config.ledger_path,
+        telegram_token=config.telegram_token,
+        alert_channel=alert_channel,
+        kill_poll_interval_s=kill_poll_interval_s,
         clock=active_clock,
         http_client=http_client,
     )
@@ -565,6 +640,7 @@ def create_server(
         "manifests": cell["manifests"],
         "global_map": cell["global_map"],
         "owner_loop": owner_loop,
+        "kill_poll_task": cell["kill_poll_task"],
         "clock": active_clock,
         "shorts": short_to_seat(config.contracts_dir),
     }
@@ -573,8 +649,13 @@ def create_server(
 
 
 def close_server(server: ThreadingHTTPServer) -> None:
-    """Stop HTTP serving and the owner tool loop."""
-    loop = server.gateway_state.get("owner_loop")  # type: ignore[attr-defined]
+    """Stop the kill poll, HTTP serving and the owner tool loop, in that order."""
+    state = server.gateway_state  # type: ignore[attr-defined]
+    loop = state.get("owner_loop")
+    poll_task = state.get("kill_poll_task")
+    if loop is not None and poll_task is not None:
+        future = asyncio.run_coroutine_threadsafe(_cancel_and_wait(poll_task), loop)
+        future.result(timeout=_CLOSE_TIMEOUT_S)
     server.shutdown()
     server.server_close()
     if loop is not None:

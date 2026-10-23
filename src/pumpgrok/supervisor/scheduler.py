@@ -23,29 +23,44 @@ import hashlib
 import logging
 import os
 import sqlite3
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
+from pumpgrok.config.settings import ExitsSettings
 from pumpgrok.core.adapter import OrderRequest, Side
-from pumpgrok.core.ids import Clock, IdFactory
-from pumpgrok.core.manifests import EXPECTED_SEAT_IDS
+from pumpgrok.core.bot import BotManifest
+from pumpgrok.core.ids import Clock, CorrelationId, IdFactory, bind_correlation
+from pumpgrok.core.manifests import EXPECTED_SEAT_IDS, load_bot_manifests
+from pumpgrok.core.registry import ToolRegistry
 from pumpgrok.core.risk_budget import RiskBudget
-from pumpgrok.engine.pipeline import decide_replay
+from pumpgrok.core.side_effect import SideEffect
+from pumpgrok.core.tool import Tool
+from pumpgrok.engine.pipeline import BUY, CandidateVerdict, decide_replay, evaluate_candidates
+from pumpgrok.execution.paper_adapter import PaperAdapter
 from pumpgrok.ledger.autonomy import read_autonomy
 from pumpgrok.ledger.reducer import initial_state, reduce
-from pumpgrok.ledger.store import LedgerStore
+from pumpgrok.ledger.store import LedgerInconsistent, LedgerStore
 from pumpgrok.ledger.views import equity_lamports
 from pumpgrok.logging.json import bind_seat
 from pumpgrok.replay.clock import FixtureClock, WallClock, format_ts_utc, parse_ts_utc
-from pumpgrok.replay.fixtures import event_epoch, load_dataset
+from pumpgrok.replay.fixtures import FixtureDataset, event_epoch, load_dataset
 from pumpgrok.replay.recorder import load_llm_records
 from pumpgrok.replay.rng import make_rng
-from pumpgrok.replay.runner import REPLAY_ROOT, llm_request_for, run_replay
+from pumpgrok.replay.runner import (
+    REPLAY_ROOT,
+    ReplayResult,
+    ReplayTrade,
+    ledger_events_hash,
+    llm_request_for,
+    run_replay,
+)
+from pumpgrok.replay.sources import FixtureCurveSource
 from pumpgrok.risk.engine import RiskEngine, utc_day
 from pumpgrok.risk.killswitch import env_engaged
 from pumpgrok.risk.limits import EngineLimits
+from pumpgrok.supervisor.exit_rules import ExitRules, RuleSell
 from pumpgrok.supervisor.health import (
     HEALTH_FILE_INTERVAL_S,
     HealthServer,
@@ -62,6 +77,9 @@ from pumpgrok.supervisor.seat_task import (
     SeatTask,
     relay_tail,
 )
+from pumpgrok.tools import build_registry
+from pumpgrok.tools.exec.place import build_place_tool
+from pumpgrok.tools.risk.kill_switch import build_kill_switch_tool
 
 if TYPE_CHECKING:
     from pumpgrok.tools.notify.notifier import Notifier
@@ -253,6 +271,7 @@ class Supervisor:
         health_path: str | Path | None = None,
         risk: Any | None = None,
         cycle_observer: Callable[[str, float, str], None] | None = None,
+        seat_cadences: Mapping[str, float] | None = None,
     ) -> None:
         unknown = set(cycles) - set(ROSTER)
         if unknown:
@@ -274,7 +293,7 @@ class Supervisor:
         self.tasks: dict[str, SeatTask] = {
             seat: SeatTask(
                 seat,
-                SEAT_CADENCES[seat],
+                (seat_cadences or {}).get(seat, SEAT_CADENCES[seat]),
                 cycles[seat],
                 clock=clock,
                 rng=rng,
@@ -284,6 +303,7 @@ class Supervisor:
                 notifier=notifier,
                 observe_only=self.observe_only,
                 cycle_observer=cycle_observer,
+                stale_cadence_s=SEAT_CADENCES[seat],
             )
             for seat in ROSTER
         }
@@ -381,17 +401,28 @@ class Supervisor:
             return
         log.error("seat %s cycle task failed: %r", seat, child.exception())
 
-    async def tick_once(self) -> dict[str, str]:
-        """One tick: start due seats and await the ones this tick started.
+    async def tick_once(self, *, heartbeats: bool = True) -> dict[str, str]:
+        """One tick: run the due seats one after another in roster order, then end the tick.
 
-        One-shot callers get every started seat's outcome. The serve loop never
-        awaits a cycle (see :meth:`serve_forever`).
+        Sequential, so a seat's order-placing work and its clock effects finish before the
+        next seat starts (deterministic on a fixture clock). ``heartbeats=False`` skips the
+        cadence staleness check, which a one-shot replay does not use.
         """
-        outcomes = self._begin_tick()
-        fresh = [seat for seat, how in outcomes.items() if how == "started"]
-        results = await asyncio.gather(*(self._inflight[seat] for seat in fresh))
-        outcomes.update(zip(fresh, results, strict=True))
-        await self._end_of_tick()
+        self._emit_rollover(self._clock.now())
+        outcomes: dict[str, str] = {}
+        for seat in ROSTER:
+            if not self.tasks[seat].is_due(self._clock.now()):
+                continue  # not due this tick: no outcome is reported, as before
+            child = asyncio.ensure_future(self.tasks[seat].run_guarded(self._seat_context(seat)))
+            self._inflight[seat] = child
+            try:
+                outcomes[seat] = await child
+            except asyncio.CancelledError:
+                child.cancel()
+                raise
+            finally:
+                self._inflight.pop(seat, None)
+        await self._end_of_tick(heartbeats=heartbeats)
         return outcomes
 
     async def run_once(self) -> dict[str, str]:
@@ -407,17 +438,23 @@ class Supervisor:
             except asyncio.CancelledError:
                 child.cancel()
                 raise
-        await self._end_of_tick()
+        # A one-shot cycle runs each seat once; cadence heartbeats apply to the serve loop.
+        await self._end_of_tick(heartbeats=False)
         return outcomes
 
-    async def _end_of_tick(self) -> None:
+    async def _end_of_tick(self, *, heartbeats: bool = True) -> None:
         now = self._clock.now()
         resumed = self.observe_only.fold_resume(self._store)
         for seat in resumed:
             log.info("seat %s resumed from observe-only", seat)
         self._sync_risk_latch()
-        for seat in ROSTER:
-            await self.tasks[seat].check_stale(now)
+        # RISK-004: live-host ticks poll env, file and alert kill sources every cycle.
+        # Replay stays hermetic: its supervisor never reads live kill state.
+        if self._risk is not None and self._source != "replay":
+            await self._risk.poll_kill_sources()
+        if heartbeats:
+            for seat in ROSTER:
+                await self.tasks[seat].check_stale(now)
         self._relay_cursor = await relay_tail(
             self._store, self._notifier, self._clock, self._relay_cursor
         )
@@ -563,14 +600,15 @@ def _replay_cycles(
     replay_llm: Any | None,
     dataset_name: str,
     filter_cfg: Any,
+    trading: _ReplayTrading | None = None,
 ) -> dict[str, Callable[[SeatContext], Awaitable[Mapping[str, Any] | None]]]:
     """The ten offline seat cycles for ``--once --replay`` (AUTO-006).
 
-    Every cycle is read-only against the replay ledger: the engine folds
-    fixture ticks, risk evaluates the sniper order (expecting refusal on
-    evidence-less candidates), and the adapter path stays simulate-only.
-    The journal fold is already on the ledger (``run_replay`` ran first),
-    so the cycle appends zero rows and the checkpoint ledger stays exact.
+    Without ``trading`` every cycle is read-only against the replay ledger: the
+    sniper evaluates one risk check and places nothing (the serve path). With
+    ``trading`` the sniper places each BUY candidate through its granted
+    ``exec.place`` tool, and risk plus PaperAdapter approve or veto each one.
+    Other seats stay read-only, and the journal fold is already on the ledger.
     """
 
     async def _chief(ctx: SeatContext) -> dict[str, Any]:
@@ -579,7 +617,13 @@ def _replay_cycles(
     async def _scout(ctx: SeatContext) -> dict[str, Any]:
         return {"candidates": len(dataset_events)}
 
+    async def _mark_open() -> None:
+        """Refresh every open position's mark (no-op without a trading wiring)."""
+        if trading is not None and trading.refresh_marks is not None:
+            await trading.refresh_marks()
+
     async def _risk(ctx: SeatContext) -> dict[str, Any]:
+        await _mark_open()
         verdict = risk.evaluate_halts(source="replay", correlation_id=ctx.correlation_id)
         return {"halt": verdict}
 
@@ -589,6 +633,9 @@ def _replay_cycles(
     async def _sniper(ctx: SeatContext) -> dict[str, Any]:
         if ctx.observe_only or not dataset_events:
             return {"orders": 0, "observe_only": ctx.observe_only}
+        await _mark_open()
+        if trading is not None:
+            return await _place_candidates(trading)
         first = dataset_events[0]
         mint = str(first.get("mint", ""))
         if len(mint) < 32:
@@ -615,7 +662,10 @@ def _replay_cycles(
 
     async def _exit(ctx: SeatContext) -> dict[str, Any]:
         opened = [e for e in store.read(limit=None) if e.get("type") == "PositionOpened"]
-        return {"open": len(opened)}
+        if trading is None or ctx.observe_only:
+            return {"open": len(opened), "rule_sells": 0}
+        sold = await _run_exit_rules(trading)
+        return {"open": len(opened), "rule_sells": len(sold)}
 
     async def _shill(ctx: SeatContext) -> dict[str, Any]:
         return {"leads": 0}
@@ -634,7 +684,8 @@ def _replay_cycles(
         return {"scoring": "llm", "outcome": outcome.outcome}
 
     async def _journal(ctx: SeatContext) -> dict[str, Any]:
-        decision = decide_replay(list(dataset_events), filter_cfg, clock.now())
+        await _mark_open()
+        decision = decide_replay(list(dataset_events), filter_cfg)
         return {"decision": decision.decision, "reason": decision.reason}
 
     return {
@@ -657,6 +708,344 @@ def dataset_events_start(dataset: Any) -> float:
     return min(stamps) if stamps else 0.0
 
 
+def dataset_stamps(dataset: Any) -> list[float]:
+    """Sorted, distinct epoch stamps of the recording: the replay timeline, in order."""
+    return sorted({event_epoch(event) for event in dataset.events})
+
+
+REPLAY_TICKET = "SOL-20260101-001"
+REPLAY_BUY_LAMPORTS = 10_000_000
+REPLAY_SLIPPAGE_BPS = 100
+DEFAULT_ROSTER_DIR = Path(__file__).resolve().parents[3] / "contracts" / "tool-rosters"
+#: The only seat that sells on exit rules (TOOL-009, PAPER-007).
+EXIT_SEAT = "bot-06-exit"
+#: Row types an order attempt writes. Only the sniper's granted trades add them.
+TRADE_ROW_TYPES = frozenset(
+    {
+        "ApprovalRecorded",
+        "FillRecorded",
+        "OrderPlaced",
+        "OrderRejected",
+        "PositionClosed",
+        "PositionOpened",
+    }
+)
+#: Risk rows a replay cycle can legitimately produce under the selected settings: a
+#: daily-loss or drawdown halt (``HaltSet``), a tripped breaker, and the position marks
+#: the journal and risk seats refresh (``MarkToMarket``). Anything else is refused.
+RISK_ROW_TYPES = frozenset({"HaltSet", "BreakerTripped", "MarkToMarket"})
+_VIRTUAL_STEP_S = 0.25
+_VIRTUAL_MAX_STEPS = 4000
+#: Real seconds between recorded steps when a serve replays its fixture timeline.
+SERVE_PACE_S = 1.0
+#: Fixture supervisors check the sniper and exit seats on every recorded tick. The recording
+#: is their poll schedule, so the seat cadence (a live-host poll rate) does not gate them.
+FIXTURE_SEAT_CADENCES: dict[str, float] = {"bot-04-sniper": 0.0, "bot-06-exit": 0.0}
+
+
+@dataclass
+class _ReplayTrading:
+    """Sniper wiring for one replay cycle: the granted place tool and the candidates."""
+
+    clock: Clock
+    ids: IdFactory
+    place: Tool
+    candidates: Sequence[CandidateVerdict]
+    attempts: list[ReplayTrade] = field(default_factory=list)
+    attempted: set[int] = field(default_factory=set)
+    exit_place: Tool | None = None
+    exits: ExitRules | None = None
+    refresh_marks: Callable[[], Awaitable[None]] | None = None
+
+
+@dataclass
+class ReplayRuntime:
+    """One offline replay sandbox: ledger, virtual clock, risk, paper adapter, registry."""
+
+    dataset: FixtureDataset
+    ledger_path: Path
+    store: LedgerStore
+    clock: Clock
+    ids: IdFactory
+    risk: RiskEngine
+    adapter: PaperAdapter
+    registry: ToolRegistry
+    manifests: dict[str, BotManifest]
+    candidates: list[CandidateVerdict]
+    curves: FixtureCurveSource
+    exits: ExitsSettings
+
+
+def open_replay_runtime(
+    dataset_dir: str | Path,
+    filter_cfg: Any,
+    *,
+    seed: int,
+    ledger_path: str | Path | None = None,
+    roster_dir: str | Path | None = None,
+    clock: Clock | None = None,
+    exits: ExitsSettings | None = None,
+    budget: RiskBudget | None = None,
+    limits: EngineLimits | None = None,
+) -> ReplayRuntime:
+    """Open one offline replay sandbox over the dataset's ledger (G1, G7).
+
+    Replay is hermetic: live-host kill state is never read (empty env, no kill
+    file), curve reads and reserves come from the fixture ticks at virtual time,
+    and the registry holds only the replay's ``exec.place`` and
+    ``risk.kill_switch`` tools. A seat reaches them only through its roster
+    grant. The sandbox runs under ``autonomous-paper``: a buy under
+    ``manual-ticket`` needs a human approval that a replay never has. Risk still
+    checks every order.
+    """
+    dataset = load_dataset(Path(dataset_dir))
+    target = (
+        Path(ledger_path)
+        if ledger_path is not None
+        else REPLAY_ROOT / dataset.manifest.dataset / "ledger.sqlite"
+    )
+    clock = clock if clock is not None else FixtureClock(start=dataset_events_start(dataset))
+    rng = make_rng(seed)
+    ids = IdFactory(clock, rng)
+    budget = budget if budget is not None else RiskBudget()
+    limits = limits if limits is not None else EngineLimits()
+    store = LedgerStore(str(target))
+    try:
+        store.set_meta("initial_equity_lamports", str(budget.paper_equity_lamports))
+        curves = FixtureCurveSource(dataset, clock)
+        risk = RiskEngine(
+            store=store,
+            budget=budget,
+            ids=IdFactory(clock, rng),
+            clock=clock,
+            limits=limits,
+            autonomy="autonomous-paper",
+            # Replay is hermetic: live-host kill state (env/file/alert) must
+            # not leak rows into the deterministic ledger.
+            env={},
+            get_reserves=curves.reserves,
+        )
+        adapter = PaperAdapter(
+            store=store,
+            risk=risk,
+            ids=IdFactory(clock, rng),
+            clock=clock,
+            rng=make_rng(seed),
+            budget=budget,
+            limits=limits,
+            price_source=curves,
+            # The fixture is the venue: no random tx drop, so a recorded buy fills.
+            p_drop=0.0,
+            source="replay",
+        )
+        registry, _audits = build_registry(clock=clock, rng=make_rng(seed))
+        registry.register(build_place_tool(adapter, lambda: budget, clock))
+        registry.register(
+            build_kill_switch_tool(
+                store,
+                clock,
+                None,
+                close_position=adapter.close_position,
+                barrier=adapter.inflight_barrier,
+            )
+        )
+        roster = Path(roster_dir) if roster_dir is not None else DEFAULT_ROSTER_DIR
+        candidates = evaluate_candidates(dataset.events, filter_cfg)
+    except BaseException:
+        store.close()
+        raise
+    return ReplayRuntime(
+        dataset=dataset,
+        ledger_path=target,
+        store=store,
+        clock=clock,
+        ids=ids,
+        risk=risk,
+        adapter=adapter,
+        registry=registry,
+        manifests=load_bot_manifests(roster),
+        candidates=candidates,
+        curves=curves,
+        exits=exits if exits is not None else ExitsSettings(),
+    )
+
+
+async def _settle_on_virtual_time(clock: FixtureClock, awaitable: Awaitable[Any]) -> Any:
+    """Await one tool call while virtual time advances, so its confirmation latency elapses.
+
+    The paper adapter sleeps its seeded confirmation latency on the fixture clock,
+    which moves only when advanced. A call that never settles within the bound
+    fails loudly instead of spinning.
+    """
+    task = asyncio.ensure_future(awaitable)
+    steps = 0
+    while not task.done():
+        if steps >= _VIRTUAL_MAX_STEPS:
+            task.cancel()
+            raise RuntimeError("replay order did not settle on virtual time")
+        clock.advance_to(clock.now() + _VIRTUAL_STEP_S)
+        steps += 1
+        await clock.yield_to_loop()
+    return task.result()
+
+
+async def _await_order(clock: Clock, awaitable: Awaitable[Any]) -> Any:
+    """Settle one order: virtual time advances on a fixture clock; a live clock awaits directly."""
+    if isinstance(clock, FixtureClock):
+        return await _settle_on_virtual_time(clock, awaitable)
+    return await awaitable
+
+
+async def _place_candidates(trading: _ReplayTrading) -> dict[str, Any]:
+    """Place each BUY candidate once, when the recorded timeline reaches its tick.
+
+    A candidate waits until the clock is at or past its own tick, and is never priced
+    from a later one. The tool resolves through the sniper's roster grant, so risk and
+    PaperAdapter approve or veto each order, and the attempt with its outcome is recorded.
+    """
+    for index, candidate in enumerate(trading.candidates):
+        if candidate.verdict.decision != BUY or index in trading.attempted:
+            continue
+        if candidate.ts > trading.clock.now():
+            continue  # the recording has not reached this candidate yet
+        trading.attempted.add(index)
+        if trading.refresh_marks is not None:
+            await trading.refresh_marks()
+        mint = candidate.token.mint
+        payload = trading.place.spec.input_model.model_validate(
+            {
+                "ticket_id": REPLAY_TICKET,
+                "mint": mint,
+                "side": "buy",
+                "decision_id": trading.ids.ulid(),
+                "size_lamports": REPLAY_BUY_LAMPORTS,
+                "max_slippage_bps": REPLAY_SLIPPAGE_BPS,
+                "approval_id": f"apr-{trading.ids.ulid()}",
+            }
+        )
+        with bind_seat("bot-04-sniper"), bind_correlation(CorrelationId.new(trading.ids)):
+            settled = await _await_order(trading.clock, trading.place(payload))
+        result = settled.model_dump(mode="json")
+        outcome = str(result["status"])
+        reason = str(result["reason"] or ("ok" if outcome == "filled" else ""))
+        trading.attempts.append(ReplayTrade(side="buy", mint=mint, outcome=outcome, reason=reason))
+    return {"orders": len(trading.attempts)}
+
+
+def _check_cycle_rows(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Only day-keyed ``DailyRollover`` rows and the sniper's order rows may be new."""
+    for row in rows:
+        row_type = row.get("type")
+        if row_type == "DailyRollover":
+            day = str((row.get("payload") or {}).get("day_utc", ""))
+            if not day or row.get("idempotency_key") != rollover_key(day):
+                raise RuntimeError("replay seat cycles wrote an unkeyed DailyRollover")
+        elif row_type in TRADE_ROW_TYPES or row_type in RISK_ROW_TYPES:
+            continue
+        elif row_type == "Escalation" and (row.get("payload") or {}).get("kind") == "graduated":
+            continue  # the exit seat closed a graduated position (exit_rules._close_graduated)
+        else:
+            raise RuntimeError(f"replay seat cycles wrote an unexpected {row_type} row")
+
+
+async def _place_rule_sell(
+    trading: _ReplayTrading, mint: str, ticket: str, units: int, rule: str
+) -> dict[str, Any]:
+    """Submit one rule sell through the exit seat's granted ``exec.place`` (TOOL-009)."""
+    if trading.exit_place is None:
+        raise RuntimeError("exit seat has no granted exec.place")
+    payload = trading.exit_place.spec.input_model.model_validate(
+        {
+            "ticket_id": ticket,
+            "mint": mint,
+            "side": "sell",
+            "decision_id": trading.ids.ulid(),
+            "token_units": units,
+            "max_slippage_bps": REPLAY_SLIPPAGE_BPS,
+            "approval_id": f"apr-{trading.ids.ulid()}",
+            "exit_reason": rule,
+        }
+    )
+    with bind_seat(EXIT_SEAT), bind_correlation(CorrelationId.new(trading.ids)):
+        settled = await _await_order(trading.clock, trading.exit_place(payload))
+    result: dict[str, Any] = settled.model_dump(mode="json")
+    outcome = str(result["status"])
+    reason = str(result["reason"] or ("ok" if outcome == "filled" else ""))
+    trading.attempts.append(
+        ReplayTrade(side="sell", mint=mint, outcome=outcome, reason=reason, rule=rule)
+    )
+    return result
+
+
+async def _run_exit_rules(trading: _ReplayTrading) -> list[RuleSell]:
+    """One exit pass at the current clock: the rules see the price as of this tick."""
+    if trading.exits is None:
+        return []
+    return await trading.exits.check(trading.clock.now())
+
+
+def _replay_trading(runtime: ReplayRuntime) -> _ReplayTrading:
+    """Resolve the sniper's and the exit seat's ``exec.place`` through their roster grants.
+
+    Each grant is resolved through the registry, so a seat without one cannot place. The
+    exit seat sells only through its own grant, and only on a rule that fired.
+    """
+    with bind_correlation(CorrelationId.new(runtime.ids)):
+        place = runtime.registry.find(
+            "exec.place",
+            max_side_effect=SideEffect.PAPER_WRITE,
+            bot=runtime.manifests["bot-04-sniper"],
+        )
+        exit_place = runtime.registry.find(
+            "exec.place",
+            max_side_effect=SideEffect.PAPER_WRITE,
+            bot=runtime.manifests[EXIT_SEAT],
+        )
+
+    async def refresh_marks() -> None:
+        """Write one combined mark for every held mint at this instant.
+
+        A position without a fresh mark is refused as data_stale and counts as zero value in
+        loss checks, so the replay refreshes marks before risk checks and before each order.
+        Each mint keeps the recorded time of its own tick, so a silent mint stays visibly old.
+        """
+        await runtime.adapter.mark_open_positions(source="replay")
+
+    trading = _ReplayTrading(
+        clock=runtime.clock,
+        ids=runtime.ids,
+        place=place,
+        candidates=runtime.candidates,
+        exit_place=exit_place,
+        refresh_marks=refresh_marks,
+    )
+
+    async def place_sell(mint: str, ticket: str, units: int, rule: str) -> dict[str, Any]:
+        return await _place_rule_sell(trading, mint, ticket, units, rule)
+
+    async def close_graduated(mint: str, last_s: int, last_t: int) -> dict[str, Any] | None:
+        """Close a graduated position at its last open reserves; book it as a trade."""
+        with bind_seat(EXIT_SEAT):
+            row = await runtime.adapter.close_on_graduation(
+                mint, last_s=last_s, last_t=last_t, source="replay"
+            )
+        if row is not None:
+            trading.attempts.append(
+                ReplayTrade(side="sell", mint=mint, outcome="filled", reason="ok", rule="graduated")
+            )
+        return row
+
+    trading.exits = ExitRules(
+        store=runtime.store,
+        curves=runtime.curves,
+        exits=runtime.exits,
+        clock=runtime.clock,
+        place_sell=place_sell,
+        graduate=close_graduated,
+    )
+    return trading
+
+
 def run_once_replay(
     dataset_dir: str | Path,
     filter_cfg: Any,
@@ -664,59 +1053,51 @@ def run_once_replay(
     seed: int,
     ledger_path: str | Path | None = None,
     health_path: str | Path | None = None,
-) -> Any:
-    """AUTO-006: replay verdict plus one full ten-seat cycle, offline.
+    roster_dir: str | Path | None = None,
+    exits: ExitsSettings | None = None,
+    budget: RiskBudget | None = None,
+    limits: EngineLimits | None = None,
+) -> ReplayResult:
+    """AUTO-006: replay verdict, then one full recorded timeline, offline.
 
-    Runs the existing ``run_replay`` first (the checkpoint verdict row,
-    stdout line, and ``cycle_end`` log stay byte-identical), then executes
-    all ten seat cycles in roster order through the engine, risk, and paper
-    adapter against the same ledger. Seat cycles are read-only, so the
-    ledger keeps exactly the verdict row.
+    ``run_replay`` writes the checkpoint verdict row first, so the stdout line and
+    ``cycle_end`` log are unchanged. The seats then run tick by tick along the recorded
+    timeline (:func:`serve_fixture_timeline`), so each BUY is judged and priced at its own
+    tick and an exit rule sees every later tick in order. The sniper places BUYs and the
+    exit seat sells through their granted ``exec.place``, so risk and PaperAdapter approve
+    or veto each order. The result lists each attempt, the final ledger sequence, and the
+    hash of the completed, verified chain.
     """
     result = run_replay(dataset_dir, filter_cfg, seed=seed, ledger_path=ledger_path)
-    source_dir = Path(dataset_dir)
-    dataset = load_dataset(source_dir)
-    if ledger_path is not None:
-        target = Path(ledger_path)
-    else:
-        target = REPLAY_ROOT / dataset.manifest.dataset / "ledger.sqlite"
-    clock = FixtureClock(start=dataset_events_start(dataset))
-    rng = make_rng(seed)
-    store = LedgerStore(str(target))
+    runtime = open_replay_runtime(
+        dataset_dir,
+        filter_cfg,
+        seed=seed,
+        ledger_path=ledger_path,
+        roster_dir=roster_dir,
+        exits=exits,
+        budget=budget,
+        limits=limits,
+    )
     try:
-        raw_autonomy = read_autonomy(store)
-        if raw_autonomy == "autonomous-paper":
-            autonomy_level: Literal["manual-ticket", "autonomous-paper"] = "autonomous-paper"
-        else:
-            autonomy_level = "manual-ticket"
-        risk = RiskEngine(
-            store=store,
-            budget=RiskBudget(),
-            ids=IdFactory(clock, rng),
-            clock=clock,
-            limits=EngineLimits(),
-            autonomy=autonomy_level,
-            # Replay is hermetic: live-host kill state (env/file/alert) must
-            # not leak rows into the deterministic checkpoint ledger; ledger
-            # KillSwitchSet rows are still honored through the store.
-            env={},
-        )
+        trading = _replay_trading(runtime)
+        rng = make_rng(seed)
         degraded = DegradedState()
-        replay_llm = load_llm_records(source_dir)
         cycles = _replay_cycles(
-            clock=clock,
+            clock=runtime.clock,
             rng=rng,
-            store=store,
-            risk=risk,
+            store=runtime.store,
+            risk=runtime.risk,
             degraded=degraded,
-            dataset_events=list(dataset.events),
-            replay_llm=replay_llm,
-            dataset_name=dataset.manifest.dataset,
+            dataset_events=list(runtime.dataset.events),
+            replay_llm=load_llm_records(Path(dataset_dir)),
+            dataset_name=runtime.dataset.manifest.dataset,
             filter_cfg=filter_cfg,
+            trading=trading,
         )
         supervisor = Supervisor(
-            store=store,
-            clock=clock,
+            store=runtime.store,
+            clock=runtime.clock,
             rng=rng,
             cycles=cycles,
             mode="paper",
@@ -725,32 +1106,77 @@ def run_once_replay(
             notifier=None,
             degraded=degraded,
             health_path=health_path,
-            risk=risk,
+            risk=runtime.risk,
+            seat_cadences=FIXTURE_SEAT_CADENCES,
         )
-        before = store.count()
-        outcomes = asyncio.run(supervisor.run_once())
-        after = store.count()
-        for seat in ROSTER:
-            if outcomes.get(seat) != "crash":
-                continue
-            raise RuntimeError(f"seat {seat} cycle crashed")
-        if after != before:
-            # 5.2 conflict resolved here (not in the seat cycles): seat cycles
-            # stay read-only, but `_begin_tick` emits the day-keyed
-            # DailyRollover for the fixture day. Only those rows may appear.
-            extra = store.read(limit=None)[before:]
-            for row in extra:
-                payload = row.get("payload") or {}
-                day = str(payload.get("day_utc", ""))
-                if row.get("type") != "DailyRollover" or not day:
-                    raise RuntimeError(f"replay seat cycles must be read-only: {before} -> {after}")
-                if row.get("idempotency_key") != rollover_key(day):
-                    raise RuntimeError(f"replay seat cycles must be read-only: {before} -> {after}")
+        before = runtime.store.count()
+        ticks = asyncio.run(
+            serve_fixture_timeline(
+                supervisor, dataset_stamps(runtime.dataset), hold=False, heartbeats=False
+            )
+        )
+        for outcome in ticks:
+            for seat in ROSTER:
+                if outcome.get(seat) == "crash":
+                    raise RuntimeError(f"seat {seat} cycle crashed")
+        _check_cycle_rows(runtime.store.read(limit=None)[before:])
         if not supervisor.ready():
-            raise RuntimeError("supervisor not ready after full cycle")
+            raise RuntimeError("supervisor not ready after the recorded timeline")
+        if not runtime.store.verify():
+            raise LedgerInconsistent("replay ledger failed verification after the cycle")
+        final_seq = int(runtime.store.read(limit=None)[-1]["seq"])
+        events_hash = ledger_events_hash(runtime.ledger_path)
     finally:
-        store.close()
-    return result
+        runtime.store.close()
+    return replace(
+        result,
+        seq=final_seq,
+        events_hash=events_hash,
+        trades=tuple(trading.attempts),
+    )
+
+
+async def serve_fixture_timeline(
+    supervisor: Supervisor,
+    stamps: Sequence[float],
+    *,
+    pace: Clock | None = None,
+    pace_s: float = 0.0,
+    hold: bool = False,
+    heartbeats: bool = True,
+) -> list[dict[str, str]]:
+    """Advance the fixture clock along the recording and tick the supervisor at each tick.
+
+    Each recorded tick is one supervisor tick at its own time, so a BUY is judged and
+    priced at its own tick and an exit rule sees every later tick in order. A tick the
+    clock has already passed (an order's latency moved it on) is skipped, never replayed
+    backwards. With ``hold`` the clock then keeps stepping at the tick cadence until the
+    supervisor is stopped, so a serve stays up after its recording ends. ``pace_s`` real
+    seconds separate steps (zero for a one-shot run), waited on the injected ``pace`` clock
+    (a ``WallClock`` in serve, so production keeps real time; never ``asyncio.sleep``).
+    Returns each recorded tick's outcomes.
+    """
+    clock = supervisor.clock
+    if not isinstance(clock, FixtureClock):
+        raise RuntimeError("a fixture timeline needs the fixture clock")
+    ticks: list[dict[str, str]] = []
+    for at in stamps:
+        if at < clock.now():
+            continue
+        clock.advance_to(at)
+        ticks.append(await supervisor.tick_once(heartbeats=heartbeats))
+        if pace_s > 0 and pace is not None:
+            await pace.sleep(pace_s)
+        if supervisor.stopped:
+            return ticks
+    if not hold:
+        return ticks
+    while not supervisor.stopped:
+        clock.advance_to(clock.now() + TICK_S)
+        await supervisor.tick_once(heartbeats=heartbeats)
+        if pace_s > 0 and pace is not None:
+            await pace.sleep(pace_s)
+    return ticks
 
 
 def build_serve_replay(
@@ -761,6 +1187,9 @@ def build_serve_replay(
     clock: Clock | None = None,
     ledger_path: str | Path | None = None,
     health_path: str | Path | None = None,
+    exits: ExitsSettings | None = None,
+    budget: RiskBudget | None = None,
+    limits: EngineLimits | None = None,
 ) -> tuple[Supervisor, Metrics, LedgerStore]:
     """Construct the D1 serve supervisor over a replayed ledger.
 
@@ -769,44 +1198,32 @@ def build_serve_replay(
     the health body carries ``ledger_source=replay`` (never live data). The
     returned store stays open; the caller closes it after the serve loop.
     """
-    if clock is None:
-        clock = WallClock()
     run_replay(dataset_dir, filter_cfg, seed=seed, ledger_path=ledger_path)
-    source_dir = Path(dataset_dir)
-    dataset = load_dataset(source_dir)
-    if ledger_path is not None:
-        target = Path(ledger_path)
-    else:
-        target = REPLAY_ROOT / dataset.manifest.dataset / "ledger.sqlite"
-    rng = make_rng(seed)
-    store = LedgerStore(str(target))
+    runtime = open_replay_runtime(
+        dataset_dir,
+        filter_cfg,
+        seed=seed,
+        ledger_path=ledger_path,
+        clock=clock,
+        exits=exits,
+        budget=budget,
+        limits=limits,
+    )
+    store = runtime.store
     try:
-        raw_autonomy = read_autonomy(store)
-        if raw_autonomy == "autonomous-paper":
-            autonomy_level: Literal["manual-ticket", "autonomous-paper"] = "autonomous-paper"
-        else:
-            autonomy_level = "manual-ticket"
-        risk = RiskEngine(
-            store=store,
-            budget=RiskBudget(),
-            ids=IdFactory(clock, rng),
-            clock=clock,
-            limits=EngineLimits(),
-            autonomy=autonomy_level,
-            env={},
-        )
+        trading = _replay_trading(runtime)
         degraded = DegradedState()
-        replay_llm = load_llm_records(source_dir)
         cycles = _replay_cycles(
-            clock=clock,
-            rng=rng,
+            clock=runtime.clock,
+            rng=make_rng(seed),
             store=store,
-            risk=risk,
+            risk=runtime.risk,
             degraded=degraded,
-            dataset_events=list(dataset.events),
-            replay_llm=replay_llm,
-            dataset_name=dataset.manifest.dataset,
+            dataset_events=list(runtime.dataset.events),
+            replay_llm=load_llm_records(Path(dataset_dir)),
+            dataset_name=runtime.dataset.manifest.dataset,
             filter_cfg=filter_cfg,
+            trading=trading,
         )
 
         def _snapshot() -> dict[str, Any]:
@@ -820,8 +1237,8 @@ def build_serve_replay(
         metrics = Metrics(snapshot=_snapshot)
         supervisor = Supervisor(
             store=store,
-            clock=clock,
-            rng=rng,
+            clock=runtime.clock,
+            rng=make_rng(seed),
             cycles=cycles,
             mode="paper",
             source="replay",
@@ -829,8 +1246,9 @@ def build_serve_replay(
             notifier=None,
             degraded=degraded,
             health_path=health_path,
-            risk=risk,
+            risk=runtime.risk,
             cycle_observer=metrics.observe,
+            seat_cadences=FIXTURE_SEAT_CADENCES,
         )
     except Exception:
         store.close()
@@ -878,6 +1296,10 @@ async def serve_replay(
     host: str = "127.0.0.1",
     ledger_path: str | Path | None = None,
     health_path: str | Path | None = None,
+    exits: ExitsSettings | None = None,
+    budget: RiskBudget | None = None,
+    limits: EngineLimits | None = None,
+    pace_s: float = SERVE_PACE_S,
 ) -> int:
     """D1 serve path: replay a recorded dataset in a loop, serving /healthz and /metrics.
 
@@ -888,7 +1310,9 @@ async def serve_replay(
     LAN safety for the container comes from the compose file, which publishes
     127.0.0.1:8080 only; there are no unauthenticated write routes.
     SIGINT/SIGTERM stop the loop and the server closes before the store does.
-    Returns 0.
+    Fixture time follows the recording (see :func:`serve_fixture_timeline`), paced
+    ``pace_s`` real seconds per step; after the last recorded tick the clock keeps
+    moving at the tick cadence until stop. Returns 0.
     """
     supervisor, metrics, store = build_serve_replay(
         dataset_dir,
@@ -896,6 +1320,9 @@ async def serve_replay(
         seed=seed,
         ledger_path=ledger_path,
         health_path=health_path,
+        exits=exits,
+        budget=budget,
+        limits=limits,
     )
     server = HealthServer(
         supervisor.clock,
@@ -907,6 +1334,13 @@ async def serve_replay(
     log.info("serve listening on %s:%d (ledger_source=replay)", host, bound)
     install_signal_handlers(supervisor.request_stop)
     try:
-        return await supervisor.serve_forever()
+        await serve_fixture_timeline(
+            supervisor,
+            dataset_stamps(load_dataset(Path(dataset_dir))),
+            pace=WallClock(),
+            pace_s=pace_s,
+            hold=True,
+        )
+        return 0
     finally:
         await _finish_serve(supervisor, server, store, health_path)

@@ -47,7 +47,7 @@ from pumpgrok.execution.latency import P_DROP, draw_latency
 from pumpgrok.ledger.reducer import PositionView, initial_state, reduce
 from pumpgrok.ledger.store import LedgerInconsistent, LedgerStore
 from pumpgrok.replay.clock import format_ts_utc, parse_ts_utc
-from pumpgrok.risk.engine import SYSTEM_EXIT_REASONS, RiskEngine, order_hash_for
+from pumpgrok.risk.engine import RULE_EXIT_REASONS, SYSTEM_EXIT_REASONS, RiskEngine, order_hash_for
 from pumpgrok.risk.killswitch import InflightBarrier
 from pumpgrok.risk.limits import EngineLimits
 from pumpgrok.tools.onchain.curve_layout import rpc_curve_price_allowed
@@ -72,6 +72,9 @@ class CurveSnapshot(BaseModel):
     complete: bool = False
     source: str = "fixture"
     slot: int | None = None
+    # Recorded time of the reading (fixture tick time). None for a live read, which is
+    # priced at the moment it is taken.
+    ts: float | None = None
 
 
 class PriceSource(Protocol):
@@ -360,6 +363,8 @@ class PaperAdapter(ExecutionAdapter):
         decision leaves the probe to its owner. Orders without a probe are
         untouched.
         """
+        if exit_reason is None:
+            exit_reason = request.exit_reason
         ledger_source = source if source is not None else self._source
         order_hash = order_hash_for(request)
         key = exec_place_key(request.ticket_id, request.side.value, request.decision_id)
@@ -1103,7 +1108,7 @@ class PaperAdapter(ExecutionAdapter):
         approval = decision.approval
         if (
             approval is not None
-            and approval.approved_by != "risk_engine"
+            and (approval.approved_by != "risk_engine" or exit_reason in RULE_EXIT_REASONS)
             and decision.approval_id is not None
         ):
             consume_key = f"consume|{decision.approval_id}"
@@ -1456,6 +1461,74 @@ class PaperAdapter(ExecutionAdapter):
         self._last_price_ts[mint] = self._clock.now()
         self._last_reserves[mint] = (curve.s_lamports, curve.t_units)
         return row
+
+    async def mark_open_positions(
+        self,
+        *,
+        source: str | None = None,
+        correlation_id: str = "desk",
+    ) -> dict[str, Any] | None:
+        """Mark every open position in one ``MarkToMarket`` row for this instant.
+
+        All prices are read before anything is written, so the row carries the combined
+        equity and the reducer's peak never sees a mix of new and old prices. Each mint's
+        mark keeps the recorded time of the snapshot it was priced from, not the current
+        time, so a silent mint shows its true age. A position with no usable curve keeps
+        its last ledger mark. Returns the row, or None when nothing is open or this exact
+        state was already marked at this instant.
+        """
+        ledger_source = source if source is not None else self._source
+        state = self._fold_state()
+        held = {m: p for m, p in state.positions.items() if p.token_units > 0 and not p.mtm_frozen}
+        if not held:
+            return None
+        now = self._clock.now()
+        marks: dict[str, dict[str, Any]] = {}
+        values: dict[str, int] = {}
+        for mint, pos in held.items():
+            curve = await self._read_curve(mint)
+            if curve is None or curve.complete:
+                values[mint] = int(pos.last_mtm_lamports)
+                continue
+            recorded = curve.ts if curve.ts is not None else now
+            gross = sell_out(curve.s_lamports, curve.t_units, pos.token_units)
+            venue = self._fees.venue_fee(gross)
+            values[mint] = gross - venue
+            marks[mint] = {
+                "mtm_lamports": gross - venue,
+                "venue_fee_lamports": venue,
+                "spot": str(spot(curve.s_lamports, curve.t_units)),
+                "source": "curve",
+                "ts_utc": format_ts_utc(recorded),
+            }
+            self._last_reserves[mint] = (curve.s_lamports, curve.t_units)
+            self._last_price_ts[mint] = recorded
+        if not marks:
+            return None
+        cash = int(state.cash_lamports)
+        equity = cash + sum(values.values())
+        basis = sum(int(p.cost_basis_lamports) for p in held.values())
+        unrealized = sum(values.values()) - basis
+        prices_json = canonical_json(marks)
+        basis_by_mint = {m: int(p.cost_basis_lamports) for m, p in held.items()}
+        key = canonical_json({"at": self._now_ts(), "prices": marks, "basis": basis_by_mint})
+        if self._store.by_key(f"mtm|{key}") is not None:
+            return None
+        return self._store.append(
+            ts_utc=self._now_ts(),
+            source=ledger_source,
+            correlation_id=correlation_id,
+            idempotency_key=f"mtm|{key}",
+            type="MarkToMarket",
+            payload={
+                "source": ledger_source,
+                "ts_source": self._now_ts(),
+                "cash_lamports": cash,
+                "equity_lamports": equity,
+                "unrealized_lamports": unrealized,
+                "prices_json": prices_json,
+            },
+        )
 
     def frozen_mark(self, mint: str) -> int | None:
         """Frozen liquidation value after a graduated/blind_flatten close."""
