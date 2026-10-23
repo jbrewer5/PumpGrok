@@ -1,0 +1,256 @@
+"""market.trades: recent token transfers from Solana RPC (TOOL-001, B9).
+
+Reads ``getSignaturesForAddress`` on the mint, then ``getTransaction``
+(jsonParsed) per signature, and classifies each qualifying movement as a
+buy (tokens in, SOL out) or a sell (tokens out, SOL in). No REST fallback
+and no websocket tail exist in this module (R44, R46, R47).
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from pumpgrok.core.errors import DataStale
+from pumpgrok.core.ids import ambient_correlation
+from pumpgrok.core.side_effect import SideEffect
+from pumpgrok.core.tool import Tool, ToolInput, ToolOutput, ToolSpec, tool
+from pumpgrok.tools._common import J4, SOLANA_RPC_SOURCE, MintStr, meta_now
+from pumpgrok.tools.onchain.rpc import RpcClient, RpcError
+
+_TX_LIMIT_PER_MINT = 200
+
+
+class Trade(BaseModel):
+    """One classified movement; money is int, price is derived Decimal."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ts: int
+    side: Literal["buy", "sell"]
+    wallet: str
+    sol_lamports: int = Field(ge=0)
+    token_units: int = Field(ge=0)
+    signature: str | None = None
+
+    def price_sol_per_token(self) -> Decimal:
+        """SOL per token for this movement (wrapper-boundary Decimal math)."""
+        if self.token_units <= 0:
+            return Decimal(0)
+        return (
+            Decimal(self.sol_lamports)
+            / Decimal(self.token_units)
+            * Decimal(1_000_000)
+            / Decimal(1_000_000_000)
+        )
+
+
+class TradesIn(ToolInput):
+    """Recent trades for ``mint``; ``since_ts`` drops older entries."""
+
+    mint: MintStr
+    limit: int = Field(default=200, ge=1, le=200)
+    since_ts: int | None = None
+
+
+class TradesOut(ToolOutput):
+    """Classified trades with the buy/sell count ratio."""
+
+    trades: list[Trade]
+    buy_sell_ratio: Decimal
+    unique_wallets: int = Field(ge=0)
+
+
+TRADES_SPEC = ToolSpec(
+    name="market.trades",
+    description=(
+        "Recent trades for a mint from RPC signatures and parsed "
+        "transactions, classified buy/sell by token and SOL flow."
+    ),
+    input_model=TradesIn,
+    output_model=TradesOut,
+    side_effect=SideEffect.READ,
+    timeout_s=10.0,
+    retry=J4,
+    rate_limit_key=SOLANA_RPC_SOURCE,
+    backend="src/pumpgrok/tools/market/trades.py via solana_rpc signatures",
+)
+
+
+def _pubkeys(message: object) -> list[str]:
+    keys = message.get("accountKeys", []) if isinstance(message, dict) else []
+    out: list[str] = []
+    for key in keys:
+        if isinstance(key, str):
+            out.append(key)
+        elif isinstance(key, dict) and isinstance(key.get("pubkey"), str):
+            out.append(key["pubkey"])
+    return out
+
+
+def _token_deltas(meta: dict[str, Any], mint: str) -> dict[int, tuple[str | None, int]]:
+    """Per token-account ``(owner, post - pre)`` for ``mint``, keyed by account index."""
+    before: dict[int, tuple[str | None, int]] = {}
+    after: dict[int, tuple[str | None, int]] = {}
+    for side, target in (("preTokenBalances", before), ("postTokenBalances", after)):
+        balances = meta.get(side, [])
+        if not isinstance(balances, list):
+            continue
+        for entry in balances:
+            if not isinstance(entry, dict) or entry.get("mint") != mint:
+                continue
+            index = entry.get("accountIndex")
+            if not isinstance(index, int):
+                continue
+            try:
+                amount = int(entry.get("uiTokenAmount", {}).get("amount", "0"))
+            except (ValueError, TypeError, AttributeError):
+                continue
+            owner = entry.get("owner")
+            target[index] = (owner if isinstance(owner, str) else None, amount)
+    deltas: dict[int, tuple[str | None, int]] = {}
+    for index in before.keys() | after.keys():
+        owner = (after.get(index) or before.get(index) or (None, 0))[0]
+        change = after.get(index, (None, 0))[1] - before.get(index, (None, 0))[1]
+        deltas[index] = (owner, change)
+    return deltas
+
+
+def _trader_token_change(meta: dict[str, Any], mint: str, wallet: str, sol_delta: int) -> int:
+    """Signed ``mint`` change for the trader; the pool's opposite leg never counts.
+
+    A swap moves tokens from the pool account to the buyer's account, so summing
+    every account nets to zero. Real RPC token balances carry ``owner``: the
+    trader's change is the sum over accounts owned by the fee payer. Without
+    owner data the trader is the account side matching the SOL direction
+    (SOL out is the buyer's gain, SOL in is the seller's loss).
+    """
+    deltas = _token_deltas(meta, mint)
+    if any(owner is not None for owner, _ in deltas.values()):
+        return sum(change for owner, change in deltas.values() if owner == wallet)
+    gains = sum(change for _, change in deltas.values() if change > 0)
+    losses = sum(change for _, change in deltas.values() if change < 0)
+    if sol_delta < 0:
+        return gains
+    if sol_delta > 0:
+        return losses
+    return 0
+
+
+def _sol_delta(meta: dict[str, Any]) -> int | None:
+    """Fee-payer lamport change (index 0); ``None`` when the balances are unreadable."""
+    pre_bal = meta.get("preBalances", [])
+    post_bal = meta.get("postBalances", [])
+    if not isinstance(pre_bal, list) or not isinstance(post_bal, list):
+        return None
+    try:
+        return int(post_bal[0]) - int(pre_bal[0])
+    except (IndexError, ValueError, TypeError):
+        return None
+
+
+def _classify(token_net: int, sol_delta: int) -> Literal["buy", "sell"] | None:
+    """Tokens in with SOL out is a buy; tokens out with SOL in is a sell."""
+    if token_net > 0 and sol_delta < 0:
+        return "buy"
+    if token_net < 0 and sol_delta > 0:
+        return "sell"
+    return None
+
+
+def parse_trade_tx(mint: str, signature: str, fallback_ts: int, tx: object) -> Trade | None:
+    """Classify one parsed transaction; ``None`` when it is not a trade."""
+    if not isinstance(tx, dict):
+        return None
+    meta = tx.get("meta")
+    if not isinstance(meta, dict) or meta.get("err") is not None:
+        return None
+    message = (
+        tx.get("transaction", {}).get("message", {})
+        if isinstance(tx.get("transaction"), dict)
+        else {}
+    )
+    keys = _pubkeys(message)
+    sol_delta = _sol_delta(meta)
+    if not keys or sol_delta is None:
+        return None
+    token_net = _trader_token_change(meta, mint, keys[0], sol_delta)
+    side = _classify(token_net, sol_delta)
+    if side is None:
+        return None
+    ts = tx.get("blockTime")
+    return Trade(
+        ts=ts if isinstance(ts, int) else fallback_ts,
+        side=side,
+        wallet=keys[0],
+        sol_lamports=abs(sol_delta),
+        token_units=abs(token_net),
+        signature=signature,
+    )
+
+
+async def fetch_trades(
+    mint: str, rpc: RpcClient, *, limit: int = 200, since_ts: int | None = None
+) -> list[Trade]:
+    """Fetch and classify up to ``limit`` movements for ``mint`` (RPC only)."""
+    try:
+        sigs = await rpc.call(
+            "getSignaturesForAddress", [mint, {"limit": min(limit, _TX_LIMIT_PER_MINT)}]
+        )
+    except RpcError as exc:
+        raise DataStale(f"market.trades signatures failed mint={mint}") from exc
+    if not isinstance(sigs, list):
+        raise DataStale(f"market.trades signatures malformed mint={mint}")
+    trades: list[Trade] = []
+    for entry in sigs[:limit]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("signature"), str):
+            continue
+        block_time = entry.get("blockTime")
+        ts = block_time if isinstance(block_time, int) else 0
+        if since_ts is not None and ts < since_ts:
+            continue
+        try:
+            tx = await rpc.call(
+                "getTransaction",
+                [
+                    entry["signature"],
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
+                ],
+            )
+        except RpcError:
+            continue
+        trade = parse_trade_tx(mint, entry["signature"], ts, tx)
+        if trade is not None:
+            trades.append(trade)
+    return trades
+
+
+async def run_trades(inp: TradesIn, rpc: RpcClient) -> dict[str, Any]:
+    """Return a validated ``TradesOut`` payload for ``inp``."""
+    trades = await fetch_trades(mint=inp.mint, rpc=rpc, limit=inp.limit, since_ts=inp.since_ts)
+    buys = sum(1 for t in trades if t.side == "buy")
+    sells = sum(1 for t in trades if t.side == "sell")
+    ratio = Decimal(buys) / Decimal(sells) if sells else Decimal(buys)
+    out = {
+        "trades": [t.model_dump() for t in trades],
+        "buy_sell_ratio": ratio,
+        "unique_wallets": len({t.wallet for t in trades}),
+        "meta": meta_now(
+            SOLANA_RPC_SOURCE,
+            inp.correlation_id or (str(a) if (a := ambient_correlation()) else None),
+            rpc.clock,
+        ),
+    }
+    return TradesOut.model_validate(out).model_dump()
+
+
+def build_trades_tool(rpc: RpcClient) -> Tool:
+    """Bind ``market.trades`` to one injected RPC client (no globals)."""
+
+    @tool(TRADES_SPEC)
+    async def _trades(payload: TradesIn) -> dict[str, Any]:
+        return await run_trades(payload, rpc)
+
+    return _trades

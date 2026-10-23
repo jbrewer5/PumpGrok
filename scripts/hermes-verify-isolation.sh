@@ -31,28 +31,40 @@ FORBIDDEN_KEYS='PRIVATE_KEY|SECRET_KEY|SEED|MNEMONIC|PHANTOM|WALLET_SECRET'
 
 [[ -f "${ROOT}/hermes/profiles.yaml" ]] || err "missing hermes/profiles.yaml"
 [[ -f "${ROOT}/hermes/cron/jobs.yaml" ]] || err "missing hermes/cron/jobs.yaml"
-[[ -f "${ROOT}/tools/desk_state.py" ]] || err "missing tools/desk_state.py"
+[[ -f "${ROOT}/src/pumpgrok/ledger/desk_bus.py" ]] || err "missing src/pumpgrok/ledger/desk_bus.py"
 [[ -f "${ROOT}/skills/hermes-cron-desk/SKILL.md" ]] || err "missing hermes-cron-desk skill"
 
-for prompt in scout-discover risk-audit chief-pickup rug-watch chief-journal; do
+for prompt in scout-discover scout-pipeline risk-audit chief-pickup rug-watch chief-journal; do
   [[ -f "${ROOT}/hermes/cron/prompts/${prompt}.md" ]] || err "missing prompt ${prompt}.md"
 done
+
+if grep -RIn -E 'tools/(desk_state|pipeline_evidence|ticket_helper)\.py' "${ROOT}/hermes/cron/prompts/"; then
+  err "cron prompt still wraps a root tool; prompts must call pumpgrok only"
+else
+  ok "cron prompts wrap pumpgrok only"
+fi
+
+if grep -RIn '^export PUMPGROK_' "${ROOT}/scripts/"*.sh; then
+  err "hermes script exports PUMPGROK_* names that Settings refuses"
+else
+  ok "no hermes script exports PUMPGROK_* names"
+fi
 
 if grep -Eq 'owner:[[:space:]]*(sniper|exit)' "${ROOT}/hermes/cron/jobs.yaml"; then
   err "jobs.yaml assigns cron to sniper or exit"
 else
   ok "jobs.yaml has no sniper/exit owners"
 fi
-
 [[ -d "${DESK}" ]] || err "desk missing: ${DESK}"
 for child in proposals briefs leads research journal incidents positions watch; do
   [[ -d "${DESK}/${child}" ]] || err "desk child missing: ${DESK}/${child}"
 done
 [[ -f "${DESK}/desk.md" ]] || err "missing ${DESK}/desk.md"
-if grep -Ei 'engagement:[[:space:]]*micro-live' "${DESK}/desk.md"; then
-  err "desk.md engagement is micro-live; cron state machine is research/paper only"
+engagement="$(grep -Ei '^[[:space:]]*engagement:' "${DESK}/desk.md" 2>/dev/null | head -1 | sed -E 's/^[^:]*:[[:space:]]*//')"
+if [[ "${engagement}" != "research" && "${engagement}" != "paper" ]]; then
+  err "desk.md engagement is '${engagement:-missing}'; cron state machine is research/paper only"
 else
-  ok "desk.md present"
+  ok "desk.md engagement=${engagement}"
 fi
 
 for role in "${ROLES[@]}"; do
@@ -91,12 +103,20 @@ for role in "${FORBIDDEN_ROLES[@]}"; do
   fi
 done
 
-if command -v python3 >/dev/null 2>&1; then
-  if ! PUMPGROK_ROOT="${ROOT}" PUMPGROK_DESK="${DESK}" python3 "${ROOT}/tools/desk_state.py" status >/tmp/pumpgrok-desk-status.json; then
-    err "desk_state.py status failed"
+if command -v uv >/dev/null 2>&1; then
+  STATUS_TMP="$(mktemp -d)"
+  # Settings refuses unknown PUMPGROK_* names (PUMPGROK_ROOT/_DESK belonged
+  # to the retired oracle), so scrub them before invoking the port CLI.
+  if (
+    cd "${STATUS_TMP}"
+    for name in $(env | cut -d= -f1 | grep '^PUMPGROK_' || true); do unset "$name"; done
+    uv run --project "${ROOT}" pumpgrok state status --seat chief >/tmp/pumpgrok-desk-status.json
+  ); then
+    ok "pumpgrok state status"
   else
-    ok "desk_state.py status"
+    err "pumpgrok state status failed"
   fi
+  rm -rf "${STATUS_TMP}"
 fi
 
 if command -v hermes >/dev/null 2>&1; then

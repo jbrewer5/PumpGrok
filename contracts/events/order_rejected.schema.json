@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Buy/sell intent refused (adapter, RiskEngine, or LiveGate).",
+  "properties": {
+    "source": {
+      "enum": [
+        "paper",
+        "replay",
+        "manual"
+      ],
+      "title": "Source",
+      "type": "string"
+    },
+    "order_id": {
+      "title": "Order Id",
+      "type": "string"
+    },
+    "decision_id": {
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "reason": {
+      "description": "R34 ids + section 2.8 reasons",
+      "title": "Reason",
+      "type": "string"
+    },
+    "detail": {
+      "title": "Detail",
+      "type": "string"
+    },
+    "stage": {
+      "description": "ACCEPTED | CONFIRMING",
+      "title": "Stage",
+      "type": "string"
+    },
+    "fees_lamports": {
+      "default": 0,
+      "title": "Fees Lamports",
+      "type": "integer"
+    },
+    "quote_out": {
+      "default": 0,
+      "description": "decision-time expected out units",
+      "title": "Quote Out",
+      "type": "integer"
+    },
+    "other_amount_threshold": {
+      "default": 0,
+      "description": "minimum acceptable out units",
+      "title": "Other Amount Threshold",
+      "type": "integer"
+    },
+    "confirm_out": {
+      "default": 0,
+      "description": "CONFIRMING-time recomputed out units",
+      "title": "Confirm Out",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "source",
+    "order_id",
+    "decision_id",
+    "reason",
+    "detail",
+    "stage"
+  ],
+  "title": "OrderRejected",
+  "type": "object"
+}

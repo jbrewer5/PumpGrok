@@ -1,0 +1,112 @@
+# Changelog
+
+All notable changes to PumpGrok are recorded here. The format follows Keep a Changelog.
+
+## [Unreleased] - Phase 1: Foundation (2026-10-21)
+
+### Added
+
+- `uv_build` src-layout package `pumpgrok` (Python 3.12) with a committed `uv.lock`; `uv sync --frozen`
+  is the install path.
+- Layered settings with startup guards: profile overlays (`dev`, `paper`, `live`), an operator
+  overlay via `PUMPGROK_CONFIG`, refusal of unknown `PUMPGROK_*` names, forbidden key-like names
+  and key-bearing values, and mode resolution `--mode` > `PUMPGROK_MODE` > TOML.
+- Hash-chained append-only ledger with a verify step, and a deterministic replay clock, seeded RNG
+  and fixture loader that checks every listed digest before any ledger file exists.
+- Skip-only replay cycle: `pumpgrok run --mode paper --once --replay <dir>` reads one recorded
+  fixture, appends one `JournalNote`, verifies the chain and exits 0. No engine runs.
+- `pumpgrok doctor`: subsystem health report. Exit 0 whenever settings are valid.
+- Redacted JSON logs with correlation IDs carried in context variables.
+- Tool and registry core (`core/`), including the `ToolRegistry` invariants and the live-write refusal.
+- Gates G-1..G-7 under `ci/gates/` with self-tests, `ci/gates/run_all.py`, the gate workflows and
+  pre-commit hook.
+- Ownership manifest `ownership.yaml`, ten seat roster and tool rosters, and the generated event
+  schemas under `contracts/events/`.
+- Multi-stage container image: `python:3.12-slim` build and runtime stages, `uv` 0.13.4, non-root
+  user, `PUMPGROK_PROFILE=paper`, the smoke replay fixture, a `pumpgrok doctor` healthcheck,
+  `SIGTERM` stop signal, and the replay as its default command.
+- `docker-compose.yml`: a one-shot `pumpgrok` service with no restart policy, optional `.env`
+  injection, loopback port binding, json-file logging and a 512M memory limit.
+- Documentation in programming-desk shape: `AGENTS.md`, `SECURITY.md`, `docs/quality-gates.md`,
+  `docs/desk-operating-model.md`, `docs/cross-bot-protocol.md`, `docs/VENDOR_PIN.md`.
+
+### Changed
+
+- `scripts/check.sh` no longer checks vendor paths. The vendor pin is checked through
+  `docs/VENDOR_PIN.md`, the emoji scan covers `.planning/**`, and a placeholder-organisation check
+  allows the organisation placeholder only in the five manifest and setup files that still carry it
+  until STRUCT-007.
+- Planning reports use ASCII status words in place of symbol glyphs.
+
+### Removed
+
+- Six tracked `*.pyc` build artifacts under `tests/` and `tools/` are untracked.
+- `issues/tissue.json`, a legacy file with no inbound references.
+
+## Phase 2: Restructure (2026-10-21)
+
+### Added
+
+- Vendor engine ported into `src/pumpgrok/engine/` (analyzer, monitor, pipeline,
+  scoring, exits, watcher, reputation, tune, alerts, models) with
+  characterization tests pinning vendor behaviour during the move.
+- Read-only tool namespaces under `src/pumpgrok/tools/` (agents, desk, exec,
+  journal, market, notify, onchain, portfolio, risk, safety, social).
+- CLI verbs exposing the ported engine and tool flows through `pumpgrok`.
+- Rewritten skills with `bots` and `gates` frontmatter on every skill directory.
+
+### Changed
+
+- Vendor code is consumed through the ported modules; root `tools/` stays as the
+  oracle until the census empties at the end of Phase 5.
+
+## Phase 3: Tools and Skills (2026-10-21)
+
+### Added
+
+- Dotted, typed tool layer with least-privilege manifests and tool rosters
+  under `contracts/tool-rosters/`.
+- Desk gateway projecting tools to seats with side-effect budgets.
+- Twelve new skills, bringing the set to 35; every skill carries `bots` and
+  `gates` frontmatter (STRUCT-007 invariant).
+- Event and tool contracts under `contracts/events/` and `contracts/README.md`.
+
+### Changed
+
+- Money stays integer lamports and base units across the new layers; no `float`
+  money fields outside the exempted vendor-parity engine code (TOOL-008).
+
+## Phase 4: Paper Trading and Autonomy (2026-10-22)
+
+### Added
+
+- Curve-faithful paper fills via the paper adapter (`getTokenLargestAccounts`
+  holder path, Jupiter Swap V2 order quotes, bonding-curve price derivation).
+- Risk engine with limits, breaker set, and kill switch; deterministic replay
+  (seeded RNG, fixture digests, read-only seat cycles) and the supervised
+  ten-seat loop under `src/pumpgrok/supervisor/`.
+- Daily and weekly ledger-backed reports (`pumpgrok report --daily/--weekly`).
+- Live refusal: `pumpgrok run --mode live` exits 3 with nine ordered R21
+  precondition lines; human-only `pumpgrok live confirm` records the
+  HMAC-signed confirmation without changing the effective mode.
+
+### Removed
+
+- `vendor/grokbot-pumpfun/` retired; the ported modules are the implementation
+  of record.
+
+## Phase 5: Hardening (in progress)
+
+### Added
+
+- Nine operator runbooks under `docs/runbooks/` (setup, engine, start/stop,
+  kill switch, breaker reset, outage, rollback, reading reports, go-live).
+- Machine-checked doc contracts: `tests/docs/test_runbook_commands.py`
+  (fenced-bash allowlist) and `tests/docs/test_changelog_phases.py`
+  (Phase 1-5 heading coverage).
+- `AGENTS.md` rules index pointing cloud agents at the normative rule files.
+
+### Changed
+
+- `docs/runbooks/setup.md` rewritten: runtime state under `./var/`, no
+  workspace-oracle claims, environment copy described in prose.

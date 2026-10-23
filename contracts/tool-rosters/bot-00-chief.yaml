@@ -1,0 +1,321 @@
+# CHIEF roster: 7 own tools + desk.* core eight (_core.yaml) = 15 effective.
+# Contract surface: contracts/tool-rosters/** (bot-02-risk, ownership.yaml). Consumer: bot-00-chief.
+# Least privilege: docs/ROSTER.md section 5 and 6; tool names from docs/TOOL_CATALOG.md.
+version: 1.1.0
+seat: bot-00-chief
+short: chief
+endpoint: /mcp/chief
+scope: seat:chief
+core: true
+packs_allowed: false
+consumers:
+- bot-00-chief
+tools:
+- name: exec.positions
+  kind: read
+  side_effect: read
+  gates: []
+  description: Open and recently closed paper positions with marks, unrealised P&L and closed reason,
+    plus equity and cash. Read only.
+  backend: exec.positions
+  input:
+    type: object
+    additionalProperties: false
+    properties:
+      mint:
+        type: string
+        minLength: 32
+        maxLength: 44
+      include_closed_since_ts:
+        type: integer
+        minimum: 0
+- name: portfolio.exposure
+  kind: read
+  side_effect: read
+  gates: []
+  description: Current equity, cash, gross exposure and per-token exposure. Read only.
+  backend: portfolio.exposure
+  input:
+    type: object
+    additionalProperties: false
+    properties:
+      mint:
+        type: string
+        minLength: 32
+        maxLength: 44
+- name: portfolio.pnl
+  kind: read
+  side_effect: read
+  gates: []
+  description: Realised, unrealised and fee P&L, daily loss fraction and drawdown for a window. Read only.
+  backend: portfolio.pnl
+  input:
+    type: object
+    additionalProperties: false
+    properties:
+      window:
+        type: string
+        enum:
+        - day
+        - week
+        - all
+        default: day
+      as_of:
+        type: string
+        format: date-time
+- name: risk.check_limits
+  kind: read
+  side_effect: read
+  gates: []
+  description: Pure evaluation of the RiskEngine rules for a prospective order. Returns the first failing
+    rule. Enforcement runs inside the paper adapter.
+  backend: risk.check_limits
+  input:
+    type: object
+    additionalProperties: false
+    properties:
+      ticket_id:
+        type: string
+        pattern: ^SOL-[0-9]{8}-[0-9]{3}$
+      mint:
+        type: string
+        minLength: 32
+        maxLength: 44
+      side:
+        type: string
+        enum:
+        - buy
+        - sell
+      size_lamports:
+        type: integer
+        minimum: 0
+      decision_id:
+        type: string
+        pattern: ^[0-9A-HJKMNP-TV-Z]{26}$
+      approval_id:
+        type: string
+        maxLength: 128
+    required:
+    - ticket_id
+    - mint
+    - side
+    - size_lamports
+- name: risk.halt_status
+  kind: read
+  side_effect: read
+  gates: []
+  description: 'Combined halt view: daily-loss floor halt, drawdown halt, kill switch, breaker states,
+    engagement and effective execution mode. Read only.'
+  backend: risk.halt_status
+  input:
+    type: object
+    additionalProperties: false
+    properties: {}
+- name: notify.alert
+  kind: write
+  side_effect: paper-write
+  gates: []
+  description: Send a human alert through the Notifier. Destinations are restricted to the notify.allowlist;
+    anything outside it is refused.
+  backend: notify.alert
+  input:
+    type: object
+    additionalProperties: false
+    properties:
+      severity:
+        type: string
+        enum:
+        - info
+        - warning
+        - critical
+      kind:
+        type: string
+        enum:
+        - rug_flag
+        - halt
+        - breaker
+        - killswitch
+        - escalation
+        - report
+        - unknown_result
+        - bot_restart_exhausted
+        - heartbeat_stale
+        - persistence_down
+        - clock_skew
+        - ledger_inconsistent
+        description: Same enum as contracts/events/escalation.schema.json kind.
+      text:
+        type: string
+        maxLength: 4000
+      ticket_id:
+        type: string
+        pattern: ^SOL-[0-9]{8}-[0-9]{3}$
+      fields:
+        type: object
+      destinations:
+        type: array
+        items:
+          type: string
+        minItems: 1
+      idempotency_key:
+        type: string
+        maxLength: 128
+      approval_id:
+        type: string
+        minLength: 1
+        maxLength: 128
+        description: Human approval reference resolved to an ApprovalRecorded event (G-6).
+      rollback_plan:
+        type: string
+        minLength: 1
+        maxLength: 500
+        description: How this write is undone or compensated if it is wrong.
+    required:
+    - severity
+    - kind
+    - text
+- name: journal.append
+  kind: write
+  side_effect: paper-write
+  gates: []
+  description: Append a seat journal entry to the ledger. The body is validated against contracts/events/<kind>.schema.json.
+  backend: journal.append
+  input:
+    type: object
+    additionalProperties: false
+    properties:
+      kind:
+        type: string
+        enum:
+        - journal_note
+        - escalation
+        description: 'Ledger kind: snake_case of an R32 type this seat may write.'
+      note_kind:
+        type: string
+        enum:
+        - ticket
+        - halt
+        - note
+        description: Required when kind is journal_note.
+      ticket_id:
+        type: string
+        pattern: ^SOL-[0-9]{8}-[0-9]{3}$
+      body:
+        type: object
+        description: Payload for the kind; validated against its schema.
+      approval_id:
+        type: string
+        minLength: 1
+        maxLength: 128
+        description: Human approval reference resolved to an ApprovalRecorded event (G-6).
+      rollback_plan:
+        type: string
+        minLength: 1
+        maxLength: 500
+        description: How this write is undone or compensated if it is wrong.
+    required:
+    - kind
+    - body
+    allOf:
+    - if:
+        properties:
+          kind:
+            const: journal_note
+        required:
+        - kind
+      then:
+        required:
+        - note_kind
+manifest:
+  id: bot-00-chief
+  display: CHIEF - Desk Orchestrator
+  channel: Trading Floor
+  purpose: 'Supervisor and process guardian: runs the scheduler, routes SCOUT
+    to RUG to RISK to WHALE/SIGNAL/SHILL to ticket to human approval to SNIPER
+    to RUG and EXIT to JOURNAL; assigns ticket ids; posts FLOOR HALTED
+    notices; restarts failed seats; escalates.'
+  inputs:
+  - every ledger event relayed in-process by the supervisor
+  - risk.halt_status
+  - seat heartbeats
+  outputs:
+  - tickets (OrderPlaced payload, PENDING_RISK/PENDING_HUMAN/APPROVED/CLOSED)
+  - desk status block
+  - halt notices
+  - Process compliance PASS/FAIL footer
+  skills:
+  - desk-operating-model
+  - desk-trade-lifecycle
+  - desk-risk-limits
+  - desk-monitoring
+  - desk-incident-response
+  - pumpgrok-setup
+  - tool-connections
+  - grokbot-pipeline
+  - hermes-cron-desk
+  - desk-folders-and-journal
+  - verification-receipts
+  - desk-doctor
+  - kill-switch
+  - live-gate-procedure
+  risk_budget:
+    max_trade_fraction: 0
+    max_token_fraction: 0
+    daily_loss_halt_fraction: "0.05"
+    drawdown_halt_fraction: "0.15"
+    max_open_positions: 0
+    max_trades_per_day: 0
+    liquidity_floor_multiple: 10
+    partial_fill_fraction: "0.02"
+    paper_equity_sol: 10
+  forbidden:
+  - trade, size, or approve spends
+  - override RISK
+  - handle keys
+  - create tickets from pipeline output alone
+  - clear a halt or the kill switch (human CLI only)
+  - D7 manipulation actions
+  fail_safe: 'On any seat heartbeat miss, breaker trip, or halt: stop dispatching
+    new leads, keep EXIT/RUG monitoring running, post observe-only status; never
+    guesses.'
+  schedule:
+  - kind: interval
+    expr: supervisor loop with health check every cycle
+  - kind: cron
+    expr: '*/15 * * * *'
+  escalation:
+  - Human via notify.alert on RISK KILL of an open ticket
+  - daily-loss halt
+  - breaker trip
+  - repeated seat restarts
+  - stale data beyond threshold
+  - any live-write attempt in the audit log
+  owned_paths:
+  - docs/desk-operating-model.md
+  - docs/cross-bot-protocol.md
+  - docs/runbooks/**
+  - prompts/bot-00-chief.xml
+  - skills/desk-operating-model/**
+  - skills/desk-trade-lifecycle/**
+  - skills/desk-monitoring/**
+  - skills/desk-incident-response/**
+  - skills/pumpgrok-setup/**
+  - skills/tool-connections/**
+  - skills/hermes-cron-desk/**
+  - skills/desk-folders-and-journal/**
+  - skills/desk-doctor/**
+  - scripts/generate-templates.py
+  - scripts/assemble-prompts.sh
+  - scripts/hermes-*.sh
+  - hermes/**
+  - src/pumpgrok/supervisor/**
+  - src/pumpgrok/cli.py
+  - src/pumpgrok/tools/notify/**
+  - services/desk-gateway/**
+  - desk_cli.py
+  - README.md
+  - SETUP.md
+  - .receipts/bot-00-chief/**
+  receipts_dir: .receipts/bot-00-chief/
+  prompt_source: prompts/bot-00-chief.xml
+  writes_to_exchange: false

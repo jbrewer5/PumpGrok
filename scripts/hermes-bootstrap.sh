@@ -55,7 +55,7 @@ Creates ~/.hermes/profiles/<role> with:
   - MEMORY.md seed that contains no default-profile memory
   - only that role's skills (copied, not the default memory store)
   - isolated config.yaml (terminal.home_mode: profile)
-  - .env containing PUMPGROK_ROOT / PUMPGROK_DESK only
+  - .env containing only allowlisted model-provider keys (no PUMPGROK_* names)
   - .no-bundled-skills marker so hermes update does not re-seed bundled skills
   - shared file-bus at --desk (default ~/trading-desk)
 
@@ -80,8 +80,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
-  echo "DRY-RUN PUMPGROK_ROOT=${ROOT}"
-  echo "DRY-RUN PUMPGROK_DESK=${DESK}"
+  echo "DRY-RUN REPO=${ROOT}"
+  echo "DRY-RUN DESK=${DESK}"
   echo "DRY-RUN HERMES_BASE=${HERMES_BASE}"
   echo "DRY-RUN roles: ${ROLES[*]}"
   echo "DRY-RUN clone_all=false copy_provider_env=${COPY_PROVIDER_ENV}"
@@ -126,9 +126,8 @@ write_env() {
   tmp="$(mktemp)"
   cat > "${tmp}" <<EOF
 # Profile-local env. Do not put seeds or private keys here.
-PUMPGROK_ROOT=${ROOT}
-PUMPGROK_DESK=${DESK}
-PUMPGROK_ROLE=${role}
+# PumpGrok paths travel via cwd and uv run --project, never via PUMPGROK_*
+# env names (Settings refuses unknown PUMPGROK_ names at startup).
 EOF
   provider_env_lines >> "${tmp}"
   if [[ "${role}" == "chief" ]]; then
@@ -204,8 +203,8 @@ EOF
   echo "${home}"
 }
 
-echo "PUMPGROK_ROOT=${ROOT}"
-echo "PUMPGROK_DESK=${DESK}"
+echo "REPO=${ROOT}"
+echo "DESK=${DESK}"
 echo "HERMES_BASE=${HERMES_BASE}"
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
@@ -229,8 +228,24 @@ else
   done
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  PUMPGROK_ROOT="${ROOT}" PUMPGROK_DESK="${DESK}" python3 "${ROOT}/tools/desk_state.py" ensure
+# Create the shared file-bus tree (mirrors the retired desk_state.py ensure:
+# eight children plus the seeded desk.md and risk-limits.md).
+for child in proposals briefs leads research journal incidents positions watch; do
+  mkdir -p "${DESK}/${child}"
+done
+if [[ ! -f "${DESK}/desk.md" ]]; then
+  cat > "${DESK}/desk.md" <<EOF
+# PumpGrok Desk Record
+Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+Engagement: research
+Halt: false
+Throwaway wallet: not yet connected
+Daily loss limit: 5 %
+Notes: Cron state machine installed. Research only.
+EOF
+fi
+if [[ ! -f "${DESK}/risk-limits.md" ]]; then
+  printf '# Risk limits\n\nStatus: interview pending\nDefault paper size: TBD\n' > "${DESK}/risk-limits.md"
 fi
 
 echo
