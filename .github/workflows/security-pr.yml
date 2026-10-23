@@ -109,7 +109,7 @@ jobs:
       - name: Install Semgrep
         # Pinned (SEC-005): unpinned scanner installs fail the guard in
         # ci/tests/test_security_workflows.py. Verified on PyPI 2026-10-22.
-        run: pip install "semgrep==1.182.1"
+        run: python -m pip install "semgrep==1.182.1"
 
       - name: Semgrep — repo rules + registry security/secrets packs
         # --error makes the exit code depend on findings; --severity ERROR keeps the PR gate to
@@ -164,7 +164,7 @@ jobs:
       - name: Install Bandit
         # Pinned (SEC-005): unpinned scanner installs fail the guard in
         # ci/tests/test_security_workflows.py. Verified on PyPI 2026-10-22.
-        run: pip install "bandit==1.9.4"
+        run: python -m pip install "bandit==1.9.4"
 
       - name: Bandit baseline — snapshot the base ref's own findings
         # A whole-repo scan fails every PR on findings already present on the base ref. Bandit's
@@ -251,7 +251,7 @@ jobs:
         # the dev group, never an ambient pip install.
         run: |
           set -euo pipefail
-          pip install "uv==0.13.4"
+          python -m pip install "uv==0.13.4"
           uv sync --frozen
           uv export --frozen --no-dev --no-emit-project --format requirements-txt --no-hashes -o req.txt
           uv run pip-audit -r req.txt --strict

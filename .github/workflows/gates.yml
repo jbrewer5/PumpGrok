@@ -55,7 +55,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install gate dependencies
-        run: pip install pyyaml
+        run: python -m pip install pyyaml
 
       # One-time waivers, decided by the repository owner in session. PR 6: ask gates, then ask
       # rollback. PR 8 (branch gap/v2-closure, same repository only): ask gapgates. G-1, G-2 and
@@ -212,7 +212,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv (pinned to the version that wrote uv.lock)
-        run: pip install "uv==0.13.4"
+        run: python -m pip install "uv==0.13.4"
       - name: Install the project so every owning test module collects
         run: uv sync --frozen
       - name: Gate test suite
