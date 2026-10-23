@@ -1,8 +1,8 @@
 """Regression guard for the GitHub workflows and the scanner configs they depend on.
 
 The workflows are YAML, not ci/gates/*.py, so test_gates.py never parses them. A later edit could
-quietly drop a blocking flag, move a job off the Omega CI runner pool, or interpolate a branch name into
-shell source, and the gate suite would stay green. These tests assert what a diff review can miss.
+quietly drop a blocking flag, move a job off the Omega CI runner pool, or interpolate a branch
+name into shell source, and the gate suite would stay green. These tests assert what a diff review can miss.
 
 They do not run the scanners (that needs network access and the tools installed).
 
