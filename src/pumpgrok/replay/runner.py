@@ -18,9 +18,10 @@ import logging
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pumpgrok.config.settings import FilterSettings
 from pumpgrok.core.errors import DataStale
@@ -34,6 +35,9 @@ from pumpgrok.replay.fixtures import EVENTS_NAME, MANIFEST_NAME, CorruptFixture,
 from pumpgrok.replay.recorder import load_llm_records
 from pumpgrok.replay.rng import DEFAULT_SEED, make_rng
 from pumpgrok.replay.sources import FixtureEventSource
+
+if TYPE_CHECKING:
+    from pumpgrok.upgrade.params import ParamSet
 
 __all__ = [
     "CYCLE_SEAT",
@@ -66,9 +70,14 @@ log = logging.getLogger(__name__)
 class ReplayTrade:
     """One order attempt a replay cycle made through the registry (G1).
 
-    ``outcome`` is the place tool's status (``filled``, ``rejected`` or
-    ``unknown``) and ``reason`` its catalog reason: ``ok`` on a fill, the risk
-    or adapter refusal otherwise.
+    ``outcome`` is the place tool's status (``filled``, ``partial``,
+    ``rejected`` or ``unknown``) and ``reason`` its catalog reason: ``ok`` on
+    a fill, the risk or adapter refusal otherwise.
+
+    Per-fill detail (BT-02) mirrors the FillRecorded row the same call wrote:
+    price, venue fee, network cost, latency and filled fraction. Money stays
+    integer base units; price and latency are Decimals. An attempt that never
+    filled keeps zeroed detail and names its outcome.
     """
 
     side: str
@@ -76,6 +85,11 @@ class ReplayTrade:
     outcome: str
     reason: str
     rule: str = ""
+    price_avg: Decimal = Decimal("0")
+    venue_fee_lamports: int = 0
+    network_cost_lamports: int = 0
+    latency_s: Decimal = Decimal("0")
+    filled_fraction: Decimal = Decimal("0")
 
 
 def format_trade(trade: ReplayTrade) -> str:
@@ -137,8 +151,17 @@ def run_replay(
     *,
     seed: int = DEFAULT_SEED,
     ledger_path: str | Path | None = None,
+    active_set: ParamSet | None = None,
 ) -> ReplayResult:
-    """Replay one fixture dataset into a fresh hash-chained ledger."""
+    """Replay one fixture dataset into a fresh hash-chained ledger.
+
+    When ``active_set`` is given, its candidate's filter settings replace ``filter_cfg``
+    before the checkpoint verdict is judged, as ``open_replay_runtime`` does for the
+    paper timeline. Exit settings never reach this verdict, so only the filter is applied.
+    ``None`` leaves the replay unchanged.
+    """
+    if active_set is not None:
+        filter_cfg = active_set.candidate().filter_settings()
     source_dir = Path(dataset_dir)
     dataset = load_dataset(source_dir)  # verifies every listed digest first
     if not dataset.events:

@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from pumpgrok.core.errors import CorruptState
 from pumpgrok.core.ids import Clock
 from pumpgrok.replay.clock import format_ts_utc, parse_ts_utc
 from pumpgrok.risk.engine import halt_key
@@ -321,7 +322,28 @@ class SeatTask:
         if self.seat_id == "bot-06-exit" and self._observe_only.is_latched(self.seat_id):
             # A latch rebuilt from the ledger must not leave buys open because the original
             # halt write never landed: restore the protective halt before any seat runs.
-            self._append_exit_halt(self._correlation_id)
+            try:
+                self._append_exit_halt(self._correlation_id)
+            except CorruptState as exc:
+                # Fail closed (INT-02): without recorded genesis equity there is no
+                # safe equity to stamp on the restored halt, so no halt is written
+                # and no zero-equity default is substituted. Treat it like an
+                # unreadable ledger: stay latched observe-only, escalate with the
+                # existing vocabulary, and never propagate out of the constructor.
+                log.error("exit halt rebuild failed for %s: %s", self.seat_id, exc)
+                self._latch_unreadable_ledger()
+                try:
+                    append_escalation(
+                        self._store,
+                        self._clock,
+                        kind=KIND_LEDGER_READ_FAILED,
+                        seat=self.seat_id,
+                        detail=f"{self.seat_id} exit halt not restored: {exc}",
+                        source=self._source,
+                        correlation_id=self._correlation_id,
+                    )
+                except Exception as append_exc:
+                    log.warning("escalation append failed for %s: %s", self.seat_id, append_exc)
 
     def _rebuild_exhaustion_latch(self) -> None:
         """Re-latch an exhausted seat from the ledger after a restart.
@@ -494,11 +516,25 @@ class SeatTask:
             log.warning("exit halt append failed: %s", exc)
 
     def _initial_equity(self) -> int:
+        """Recorded initial equity; missing or corrupt meta raises, never 0."""
         try:
             meta = self._store.get_meta("initial_equity_lamports")
-            return int(meta) if meta is not None else 0
-        except Exception:
-            return 0
+        except sqlite3.Error as exc:
+            raise CorruptState(
+                f"seat {self.seat_id}: cannot read initial_equity_lamports: {exc}"
+            ) from exc
+        if meta is None:
+            raise CorruptState(
+                f"seat {self.seat_id}: initial_equity_lamports meta is missing; "
+                "refusing a zero-equity default"
+            )
+        try:
+            return int(meta)
+        except (TypeError, ValueError) as exc:
+            raise CorruptState(
+                f"seat {self.seat_id}: corrupt initial_equity_lamports {meta!r}; "
+                "refusing a zero-equity default"
+            ) from exc
 
     async def check_stale(self, now: float) -> bool:
         """Edge-triggered heartbeat_stale escalation; True on the rising edge."""

@@ -34,9 +34,9 @@ from pumpgrok.supervisor.scheduler import (
     ROSTER,
     DegradedState,
     Supervisor,
-    _replay_cycles,
     serve_replay,
 )
+from pumpgrok.supervisor.scheduler.replay_cycles import _replay_cycles
 from pumpgrok.supervisor.seat_task import SeatContext, SeatTask
 
 REPO = Path(__file__).resolve().parents[2]
@@ -288,7 +288,7 @@ async def test_stop_writes_snapshot_export_and_stopped_health(
         captured.append(stop)
         installed.set()
 
-    monkeypatch.setattr(scheduler, "install_signal_handlers", _capture_stop)
+    monkeypatch.setattr(scheduler.serve, "install_signal_handlers", _capture_stop)
     ledger = tmp_path / "var" / "ledger.sqlite"
     health = tmp_path / "health.json"
 

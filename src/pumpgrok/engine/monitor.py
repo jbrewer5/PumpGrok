@@ -30,18 +30,20 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
+from decimal import Decimal
 from typing import Any
 
 from websockets.asyncio.client import connect
 
 from pumpgrok.config.settings import DataSettings, FilterSettings
+from pumpgrok.core.units import sol_to_lamports
 from pumpgrok.engine.models import Token
 from pumpgrok.replay.clock import Clock
 
 log = logging.getLogger(__name__)
 
-# A pump.fun curve counts as filled at about 85 SOL in reserve.
-CURVE_COMPLETION_SOL = 85.0
+# A pump.fun curve counts as filled at about 85 SOL in reserve. Held as integer lamports (INT-01).
+CURVE_COMPLETION_LAMPORTS = sol_to_lamports(Decimal(85))
 
 # How long to keep a launch buffered while it never gains buyers.
 PENDING_TTL_SECONDS = 900.0
@@ -81,6 +83,14 @@ def _coerce_float(value: Any, default: float) -> float:
         return default
 
 
+def _coerce_lamports(value: Any, default: int) -> int:
+    """Best-effort SOL amount to integer lamports, ROUND_HALF_UP. Default on garbage."""
+    try:
+        return sol_to_lamports(Decimal(str(value)))
+    except (ArithmeticError, ValueError, TypeError):
+        return default
+
+
 def parse_create_event(payload: dict[str, Any], now: float) -> Token | None:
     """A token-creation event becomes a Token. None when it is not one."""
     try:
@@ -93,7 +103,7 @@ def parse_create_event(payload: dict[str, Any], now: float) -> Token | None:
         created = payload.get("timestamp") or payload.get("createdTimestamp")
         created_num = _coerce_float(created, now)
         created_ts = created_num / 1000.0 if created and created_num > 1e11 else created_num
-        sol_in_curve = _coerce_float(payload.get("vSolInBondingCurve"), 0.0)
+        sol_in_curve = _coerce_lamports(payload.get("vSolInBondingCurve"), 0)
 
         return Token(
             mint=mint,
@@ -108,8 +118,8 @@ def parse_create_event(payload: dict[str, Any], now: float) -> Token | None:
             creator=payload.get("traderPublicKey") or payload.get("creator"),
             created_timestamp=created_ts,
             sol_in_curve=sol_in_curve,
-            market_cap_sol=_coerce_float(payload.get("marketCapSol"), 0.0),
-            curve_progress=min(1.0, sol_in_curve / CURVE_COMPLETION_SOL),
+            market_cap_sol=_coerce_lamports(payload.get("marketCapSol"), 0),
+            curve_progress=min(1.0, sol_in_curve / CURVE_COMPLETION_LAMPORTS),
         )
     except (TypeError, ValueError, AttributeError) as exc:
         log.warning("dropping malformed create event: %s", type(exc).__name__)

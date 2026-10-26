@@ -11,8 +11,10 @@ confidence instead of excusing the token.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any, ClassVar
 
+from pumpgrok.core.units import lamports_to_sol
 from pumpgrok.engine.agents.base import JSON_ONLY, GrokAgent
 from pumpgrok.engine.models import AuditResult, Holder, Token, TokenMetrics, Trade
 
@@ -76,7 +78,7 @@ class AuditorAgent(GrokAgent):
                 {
                     "wallet": trade.wallet,
                     "side": "buy" if trade.is_buy else "sell",
-                    "sol": round(trade.sol_amount, 6),
+                    "sol": str(lamports_to_sol(Decimal(trade.sol_amount))),
                     "t": round(trade.timestamp - token.created_timestamp, 2)
                     if token.created_timestamp
                     else trade.timestamp,

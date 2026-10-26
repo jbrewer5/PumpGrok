@@ -17,12 +17,12 @@ Deliberate divergences from the oracle:
 - Detail strings are English ASCII (``from entry``, ``from peak``).
 """
 
-from __future__ import annotations
+from decimal import ROUND_HALF_UP, Decimal
 
 from pydantic import BaseModel, ConfigDict
 
 from pumpgrok.config.settings import ExitsSettings
-from pumpgrok.engine.models import ExitPosition
+from pumpgrok.engine.models import PRICE_SCALE, ExitPosition
 
 # Rule order is priority order. Stop-loss first, profit second, trailing
 # third, time last: a runner closes on take-profit, not on the timer.
@@ -38,13 +38,14 @@ class ExitSignal(BaseModel):
     detail: str = ""
 
 
-def pnl_pct(position: ExitPosition, price: float) -> float:
+def pnl_pct(position: ExitPosition, price: int) -> float:
+    """PnL percent vs entry. Prices are PRICE_SCALE integers; the percent is a ratio."""
     if position.entry_price <= 0:
         return 0.0
     return (price - position.entry_price) / position.entry_price * 100.0
 
 
-def stop_loss_triggered(position: ExitPosition, price: float, stop_loss_pct: float) -> bool:
+def stop_loss_triggered(position: ExitPosition, price: int, stop_loss_pct: float) -> bool:
     if position.entry_price <= 0 or price <= 0 or stop_loss_pct <= 0:
         return False
     return -pnl_pct(position, price) >= stop_loss_pct
@@ -52,7 +53,7 @@ def stop_loss_triggered(position: ExitPosition, price: float, stop_loss_pct: flo
 
 def exit_signal(
     position: ExitPosition,
-    price: float,
+    price: int,
     cfg: ExitsSettings,
     now: float,
 ) -> ExitSignal | None:
@@ -97,7 +98,7 @@ def exit_signal(
 
 def apply_price(
     position: ExitPosition,
-    price: float,
+    price: int,
     cfg: ExitsSettings,
     now: float,
 ) -> ExitSignal | None:
@@ -111,3 +112,18 @@ def apply_price(
     """
     position.peak_price = max(position.peak_price, price)
     return exit_signal(position, price, cfg, now)
+
+
+def restore_peak(entry_price: int, ledger_peak: Decimal) -> int:
+    """Peak to track after a restart, from the ledger fold. Pure.
+
+    The serve loop writes the running peak into each ``MarkToMarket`` row's
+    ``spot`` (the reducer ratchets ``price_peak`` from it, existing R32 type,
+    no new event), so a fresh book re-learns the peak from the fold instead
+    of from the next curve read. Never below entry: a position that never
+    printed above entry restarts with the entry peak. Conversion matches
+    ``_scaled_price`` (half-up); an undecodable peak raises instead of
+    silently defaulting.
+    """
+    scaled = int((ledger_peak * PRICE_SCALE).to_integral_value(rounding=ROUND_HALF_UP))
+    return max(entry_price, scaled)

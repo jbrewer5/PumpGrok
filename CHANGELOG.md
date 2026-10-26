@@ -2,6 +2,121 @@
 
 All notable changes to PumpGrok are recorded here. The format follows Keep a Changelog.
 
+## [Unreleased] - v3 Phase 10: live readiness, kept disabled
+
+### Added
+
+- LIV-01 refusal proof: `pumpgrok run --mode live --once` exits 3 with all nine preconditions in R21 order on stderr (tests/safety/test_live_refusal_lists_nine.py).
+- LIV-01 empty-registry proof: build_adapter returns a PaperAdapter only; no live adapter symbol or registry entry is exported (tests/safety/test_no_live_adapter_registered.py).
+- LIV-01 import-graph proof: no transitive import path from the backtest, paper-adapter, upgrade, supervisor, or CLI roots reaches the live adapter module (tests/safety/test_import_graph_no_live.py).
+- LIV-02 overlay-disabled proof: every overlay under src/pumpgrok/config/overlays ships with live disabled (tests/safety/test_live_disabled_overlays.py).
+- LIV-02 deferred record: docs/LIVE_READINESS.md records the custody model, the venue, the legal review, and the nine-precondition evidence, each with owner human and status deferred. The desk stays paper-only and claims no measured readiness.
+
+### Verified
+
+- Phase 10: smoke-10m events.hash before: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+- Phase 10: smoke-10m events.hash after: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+- No task in this phase changed replay bytes: the record and all phase proofs are docs and safety tests only, with no product code change.
+
+## [Unreleased] - v3 Phase 9: bounded paper self-upgrade
+
+### Added
+
+- UPG-01 adds content-hashed parameter sets within version-controlled bounds (src/pumpgrok/config/upgrade_bounds.toml). An out-of-bounds value fails with a typed error and is never clamped.
+- UPG-02 gates every promotion in fixed order: bounds, trial limits, autonomy level, holdout, then the Phase 8 divergence check. The first failure is the typed reason.
+- UPG-03 records each active-set change as a ConfigChanged row with evidence under var/upgrade/promotions/, and restores the exact prior set in one operation.
+- UPG-04 escalates an ineligible candidate through the existing Escalation channel with a decision request. It never writes an active-set row.
+- UPG-05 treats BLIND on SAFE-4 and SAFE-8 as advisory while no paid RPC provider is recorded (PUMPGROK_PAID_RPC_PROVIDER). Setting the provider restores the KILL contract.
+- UPG-06 applies the owner-approved constitution amendment of 2026-10-25 to the rules, the desk skill, the agent prompts and the risk policy, with a frozen oracle test. The risk seat alone carries the amended clause 3.
+
+### Verified
+
+- Phase 9: smoke-10m events.hash before: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+- Phase 9: smoke-10m events.hash after: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+
+## [Unreleased] - v3 Phase 8: backtest and paper evaluation
+
+### Added
+
+- BT-01 adds the backtest run manifest holding the whole-dataset digest, seed, FilterSettings hash, parameter-set hash and code version, with the run id derived from that manifest.
+- BT-02 exposes per-fill price, venue fee, network cost, latency, filled fraction and outcome on replay results.
+- BT-03 reserves the final 20 percent of a dataset time window as holdout, never used for tuning, with walk-forward folds over the pre-holdout region and named split identifiers.
+- BT-04 records every parameter trial; a search above 20 trials is flagged ineligible for promotion and above 50 trials is rejected with a typed error.
+- BT-05 bounds metrics to return, maximum drawdown from a running peak, a Sharpe-style ratio with annualization stated in code, win rate, trade count, exposure and turnover, with no expected-return language.
+- BT-06 adds the pumpgrok backtest verb running a parameter set over a recorded dataset with the holdout, printing a byte-identical deterministic report.
+- BT-07 replaces the engine grid search with the holdout-aware harness as the single search engine.
+- PAP-01 shares one result schema between backtest results and paper ledger trades over the same window.
+- PAP-02 checks divergence on the 2 percentage point absolute return gap and 0.5 Sharpe gap defaults, alerting and blocking promotion on breach.
+- PAP-03 verifies autonomous paper end to end on the recorded smoke and smoke-10m datasets at the human-set autonomous-paper level, with manual-ticket never running an upgrade and no backtest-to-live path.
+
+### Verified
+
+- Phase 8: smoke-10m events.hash before: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+- Phase 8: smoke-10m events.hash after: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+- Phase 8 correction: the first harness scored candidates with a hash digest. It was replaced before the phase closed: candidates now rank by net realized lamports from replayed fills, and the report shows measured fees, slippage and metrics. Per-fill fields are held in memory only, so the replay ledger bytes and the hash are unchanged.
+
+## [Unreleased] - v3 Phase 7: documentation upgrade
+
+### Changed
+
+- DOC-01 adds the CLAUDE.md codebase map at the repository root.
+- DOC-02 trims AGENTS.md to its rules, with the offline verify script scripts/verify_doc_commands.sh.
+- DOC-03 corrects README, ARCHITECTURE, SETUP, the replay skill and the four plugin manifests (version 0.1.0) to match the code, with docs/VENDOR_PIN.md recording the retired oracle.
+- DOC-04 banners historical design records, with consistency and banner tests under tests/docs.
+
+### Verified
+
+- Phase 7: smoke-10m events.hash after: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+
+## [Unreleased] - v3 Phase 6: integrity closure
+
+### Changed
+
+- Money crosses module boundaries as integer lamports or base units; Decimal is used only for ratios. Ledger export writes exact decimal strings (INT-01).
+- Missing or corrupt state fails closed with CorruptState instead of defaulting to zero, and a seat whose genesis equity is unreadable latches at construction (INT-02).
+- The daily-loss halt uses integer arithmetic; a non-positive start equity fails the check instead of reading as zero loss (INT-03).
+- One SOL-to-lamports conversion lives in core/units.py. The live gate takes now from its caller and reads no wall clock (INT-04, INT-06).
+- Randomness is confined to the approval-id and binding-key roots, enforced by the static guard. Production id and RNG factories take an explicit seed; DEFAULT_SEED stays in replay code (INT-05).
+- Long paper-adapter and replay-cycle functions are split into stage functions with unchanged behaviour (INT-08).
+- Trailing-stop peaks are restored from the ledger after a serve restart, through existing event types only (INT-09).
+- scripts/probe_curve_layout.py is a read-only curve layout probe. LAYOUT_STATUS stays ASSUMED, so entries stay fail-closed (INT-10). The probe ran with no account configured and made no RPC call.
+
+### Verified
+
+- The WR-07 replay ledger cleanup and the partial-sell venue fee scaling (INT-07) were already on main; regression tests were added.
+- Phase 6: smoke-10m events.hash before: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+- Phase 6: smoke-10m events.hash after: b69c29593954129b52a8c9ab1cad390441b7b356dd482b8c7a4345bea55ad32d
+
+### Review: Omega CI runner migration (commits 5b5d6a1, 9772655)
+
+- Every job moved from GitHub-hosted runners to the self-hosted pool [self-hosted, linux, x64, omega-ci]. This reverses the earlier stance that self-hosted runners are not used, so it is a policy change and needs owner sign-off.
+- Fork pull requests are skipped on every job, so fork code never reaches the pool. Same-repository branches do run on it, so the trust boundary is who can push a branch.
+- Trivy moved from the SHA-pinned aquasecurity/trivy-action to the binary baked into the runner image. The binary is not version-pinned in the workflow, and its vulnerability database is fetched on every run.
+- Ephemerality of pool runners is not verified in this repository. Job-to-job state on a persistent runner is a risk until it is confirmed.
+- ci/tests/test_security_workflows.py no longer forbids self-hosted runners. Its Trivy severity, exit-code and ignore-unfixed assertions remain.
+
+### Owner closure (2026-10-26)
+
+- Phase 6 closes with two owner-approved deviations (PROJECT V3-5; approved_by human:SomeRandmGuyy).
+- Criterion 17: G-1 (170 foreign-owned paths) and G-2 are waived in CI for the Phase 6 pull request only, through a PR-number condition in .github/workflows/gates.yml. run_all.py still exits 1 locally on G-1.
+- Criterion 16: the phase pull request is ready for review, not draft. It merges to main through ultrathink-ship after CI is green and Greptile reaches 5/5 with no open threads.
+- The 2026-10-25 re-own decision is superseded. The paths stay foreign-owned until a follow-up change, and the waiver stays on main until a cleanup change removes it.
+
+### Review fixes (PR 16, Greptile round 1)
+
+- Paper ledger: the genesis equity is written once, when a paper ledger is first opened by a CLI verb or the composition root. A ledger with events but no genesis now fails closed with CorruptState instead of taking the configured budget as its base.
+- Active sets: recording stores the overrides under their content hash in the operator ledger. Paper runs and the checkpoint verdict apply the restored filter and exits. The candidate type moved to backtest/candidate.py to break an import cycle; evaluate re-exports it.
+- Backtests: a candidate hash equals its ParamSet hash, so the gate accepts real search winners. Net scoring counts each fee once (recorded cash changes minus refused-attempt fees). Folds are cut on distinct timestamps and raise ValueError when there are too few. The holdout is replayed once per backtest. Identical backtests cannot run at once (run-directory lock). Float parameters are a usage error (exit 1).
+- Backtest identity: the report identifies the evaluated filter, exits, risk budget and limits. Backtests evaluate the desk-default risk budget and limits, not the operator's configured overlay; that is recorded as a decision.
+- Promotion evidence: a second record with different content at the same candidate hash raises PromotionEvidenceConflict. The manifest is created with an exclusive open.
+- Startup: PUMPGROK_PAID_RPC_PROVIDER is a registered non-setting name.
+- Docs and checks: the CLAUDE.md codebase map names current modules; verify_doc_commands.sh rejects shell operators before execution; the curve probe records VERIFIED only for the expected program owner and account discriminator; the analyzer SOL conversion uses core.units.
+- Tests: the import-graph check walks child modules; the autonomy e2e test checks the policy gate directly.
+- Round 2: the holdout and the paper window share one end rule (the next float after the last holdout ledger row, including settling orders), so both sides count the same fills. The report's window_end_utc is that last holdout row. An empty holdout ledger is a ConfigError.
+- Round 2: promotion evidence is published by a hard link from a complete temporary file in the same directory, so a reader never sees a partial manifest. Manifests are created with owner-only mode (0600).
+
+Follow-ups, not changed in this cycle: default-genesis fallbacks remain in execution/paper_adapter (_fold_state), ledger/reconcile (_genesis) and a supervisor docstring; the replay runtime still fixes autonomy to autonomous-paper; a forced-close fill uses a placeholder decision id until core/adapter.py accepts an empty decision id; the CI waiver is removed by a cleanup change after the merge.
+
 ## [Unreleased] - Audit fixes
 
 ### Fixed
