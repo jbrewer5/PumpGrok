@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pumpgrok.core.idempotency import canonical_json
 from pumpgrok.core.ids import Clock
 from pumpgrok.execution.curve_math import sell_out, spot
-from pumpgrok.execution.fees import FeeModel
+from pumpgrok.execution.fees import FeeModel, take_fee
 from pumpgrok.execution.paper_adapter.models import CurveSnapshot, _ledger_mark_epoch
 from pumpgrok.ledger.reducer import PositionView, initial_state, reduce
 from pumpgrok.ledger.store import LedgerInconsistent, LedgerStore
@@ -113,10 +113,10 @@ class _MarksMixin:
         if pos is None or pos.token_units <= 0 or pos.mtm_frozen:
             return None
         curve = await self._read_curve(mint)
-        if curve is None or curve.complete:
+        if curve is None or curve.complete or curve.blind:
             return None
         gross = sell_out(curve.s_lamports, curve.t_units, pos.token_units)
-        venue = self._fees.venue_fee(gross)
+        venue = take_fee(self._fees.venue_fee_bps, gross, curve.fee_bps)
         mtm = gross - venue
         cash = int(state.cash_lamports)
         # Book value: this mint at the fresh mark, every other open position at

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pumpgrok.core.adapter import Fill, FillStatus, OrderRequest
 from pumpgrok.core.errors import OrderRejectedError
 from pumpgrok.execution.curve_math import impact_sell, sell_out
+from pumpgrok.execution.fees import take_fee
 from pumpgrok.execution.paper_adapter.models import CurveSnapshot
 from pumpgrok.replay.clock import parse_ts_utc
 
@@ -161,7 +162,7 @@ class _SellMixin:
         fraction = Decimal(filled_units) / Decimal(units)
         slippage_bps = self._slippage_bps(request)
         gross0 = sell_out(curve0.s_lamports, curve0.t_units, filled_units)
-        out0 = gross0 - self._fees.venue_fee(gross0)
+        out0 = gross0 - take_fee(self._fees.venue_fee_bps, gross0, curve0.fee_bps)
         threshold = out0 * (10_000 - slippage_bps) // 10_000
         order_id = self._ids.ulid()
         quote_id = self._ids.ulid()
@@ -217,7 +218,7 @@ class _SellMixin:
                 correlation_id=correlation_id,
             )
         gross1 = sell_out(curve1.s_lamports, curve1.t_units, filled_units)
-        out1 = gross1 - self._fees.venue_fee(gross1)
+        out1 = gross1 - take_fee(self._fees.venue_fee_bps, gross1, curve1.fee_bps)
         if out1 < threshold:
             self._inflight.discard(order_id)
             raise await self._reject(
@@ -257,7 +258,9 @@ class _SellMixin:
                     "filled_units": filled_units,
                     "filled_fraction": str(fraction),
                     "price_avg": str(price_avg),
-                    "venue_fee_lamports": self._fees.venue_fee(gross1),
+                    "venue_fee_lamports": take_fee(
+                        self._fees.venue_fee_bps, gross1, curve1.fee_bps
+                    ),
                     "network_cost_lamports": network_cost,
                     "cash_delta_lamports": proceeds,
                     "latency_s": str(Decimal(str(latency_s))),
@@ -266,7 +269,7 @@ class _SellMixin:
                     "curve_before_t": curve0.t_units,
                     "curve_after_s": curve1.s_lamports,
                     "curve_after_t": curve1.t_units,
-                    "route": "curve",
+                    "route": curve0.venue if curve0.venue == "pumpswap" else "curve",
                     "realised_slippage_bps": slipped,
                 },
             }
@@ -317,8 +320,8 @@ class _SellMixin:
             filled_fraction=fraction,
             price_avg=price_avg,
             realised_slippage_bps=slipped,
-            venue_fee_lamports=self._fees.venue_fee(gross1),
+            venue_fee_lamports=take_fee(self._fees.venue_fee_bps, gross1, curve1.fee_bps),
             network_cost_lamports=network_cost,
-            route="curve",
+            route="pumpswap" if curve0.venue == "pumpswap" else "curve",
             ledger_seq=int(stored[0]["seq"]),
         )

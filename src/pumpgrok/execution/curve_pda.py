@@ -86,9 +86,41 @@ def find_program_address(seeds: list[bytes], program_id: bytes) -> tuple[bytes, 
 
 def bonding_curve_pda(mint: str) -> str:
     """Base58 bonding-curve address for ``mint`` under the pump.fun program."""
-    mint_bytes = b58decode(mint)
-    program = b58decode(PUMP_PROGRAM_ID)
-    if len(mint_bytes) != 32 or len(program) != 32:
-        raise ValueError("mint and program must decode to 32 bytes")
+    mint_bytes = _pubkey(mint)
+    program = _pubkey(PUMP_PROGRAM_ID)
     address, _bump = find_program_address([_CURVE_SEED, mint_bytes], program)
     return b58encode(address)
+
+
+def pool_authority_pda(mint: str) -> str:
+    """Pump ``pool-authority`` PDA for ``mint`` (the migrate pool creator)."""
+    address, _bump = find_program_address(
+        [b"pool-authority", _pubkey(mint)], _pubkey(PUMP_PROGRAM_ID)
+    )
+    return b58encode(address)
+
+
+_AMM_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+
+
+def canonical_pool_pda(base_mint: str, quote_mint: str) -> str:
+    """PumpSwap pool at index 0 created by ``migrate`` for this pair."""
+    authority = _pubkey(pool_authority_pda(base_mint))
+    address, _bump = find_program_address(
+        [
+            b"pool",
+            (0).to_bytes(2, "little"),
+            authority,
+            _pubkey(base_mint),
+            _pubkey(quote_mint),
+        ],
+        _pubkey(_AMM_PROGRAM_ID),
+    )
+    return b58encode(address)
+
+
+def _pubkey(text: str) -> bytes:
+    raw = b58decode(text)
+    if len(raw) != 32:
+        raise ValueError("pubkey must decode to 32 bytes")
+    return raw

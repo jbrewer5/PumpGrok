@@ -28,9 +28,13 @@ from pumpgrok.tools.onchain.rpc import RpcClient, RpcError
 _ACCOUNT = json.loads(
     Path("tests/fixtures/rpc/bonding_curve/account.json").read_text(encoding="utf-8")
 )
+_SOL_CURVE = json.loads(
+    Path("tests/fixtures/rpc/bonding_curve/sol_curve.json").read_text(encoding="utf-8")
+)
 _MINT = str(_ACCOUNT["mint"])
 _WSOL = "So11111111111111111111111111111111111111112"
-_B64 = str(_ACCOUNT["account_b64"])
+# SOL-quoted curve (quote mint is the zero pubkey). The other recorded curve is HYPE.
+_B64 = str(_SOL_CURVE["b64"])
 
 
 def _install_rpc(monkeypatch: pytest.MonkeyPatch, *, present: bool) -> None:

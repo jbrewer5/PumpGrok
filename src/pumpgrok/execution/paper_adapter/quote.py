@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from pumpgrok.core.adapter import Quote, Side, SimulationResult
 from pumpgrok.core.errors import OrderRejectedError
 from pumpgrok.execution.curve_math import buy_out, impact_buy, impact_sell, sell_out, spot
+from pumpgrok.execution.fees import take_fee
 
 if TYPE_CHECKING:
     from pumpgrok.core.ids import Clock, IdFactory
@@ -38,6 +39,12 @@ class _QuoteMixin:
         curve = await self._read_curve(output_mint)
         if curve is None:
             raise OrderRejectedError("no_reserves", f"mint={output_mint}", stage="ACCEPTED")
+        if curve.blind:
+            raise OrderRejectedError(
+                "data_unavailable",
+                "BLIND: quote mint has no verified SOL conversion",
+                stage="ACCEPTED",
+            )
         out_amount = buy_out(curve.s_lamports, curve.t_units, amount)
         threshold = out_amount * (10_000 - slippage_bps) // 10_000
         return Quote(
@@ -62,7 +69,7 @@ class _QuoteMixin:
     ) -> SimulationResult:
         """Pure-math preview: no risk check, no latency, no ledger writes."""
         curve = await self._read_curve(mint)
-        if curve is None:
+        if curve is None or curve.blind:
             return SimulationResult(
                 would_fill=False,
                 fill_kind="rejected",
@@ -72,7 +79,9 @@ class _QuoteMixin:
                 venue_fee_lamports=0,
                 network_cost_lamports=self._fees.network_cost(),
                 liquidity_ratio=Decimal("0"),
-                rejection_reason="no_reserves",
+                rejection_reason="data_unavailable"
+                if curve is not None and curve.blind
+                else "no_reserves",
                 latency_ms_estimate=1200,
             )
         if side is Side.BUY:
@@ -80,14 +89,18 @@ class _QuoteMixin:
             if curve.s_lamports < self._floor(size):
                 return self._sim_reject("below_liquidity_floor", curve.s_lamports, size)
             filled = min(size, self._fill_cap(curve.s_lamports))
-            out = buy_out(curve.s_lamports, curve.t_units, filled - self._fees.venue_fee(filled))
+            out = buy_out(
+                curve.s_lamports,
+                curve.t_units,
+                filled - take_fee(self._fees.venue_fee_bps, filled, curve.fee_bps),
+            )
             return SimulationResult(
                 would_fill=True,
                 fill_kind="full" if filled == size else "partial",
                 price_expected=spot(curve.s_lamports, curve.t_units),
                 expected_out=out,
                 price_impact_pct=impact_buy(curve.s_lamports, filled),
-                venue_fee_lamports=self._fees.venue_fee(filled),
+                venue_fee_lamports=take_fee(self._fees.venue_fee_bps, filled, curve.fee_bps),
                 network_cost_lamports=self._fees.network_cost(),
                 liquidity_ratio=Decimal(curve.s_lamports) / Decimal(size),
                 rejection_reason=None,
@@ -104,9 +117,9 @@ class _QuoteMixin:
             would_fill=True,
             fill_kind="full" if filled_units == units else "partial",
             price_expected=spot(curve.s_lamports, curve.t_units),
-            expected_out=gross - self._fees.venue_fee(gross),
+            expected_out=gross - take_fee(self._fees.venue_fee_bps, gross, curve.fee_bps),
             price_impact_pct=impact_sell(curve.t_units, filled_units),
-            venue_fee_lamports=self._fees.venue_fee(gross),
+            venue_fee_lamports=take_fee(self._fees.venue_fee_bps, gross, curve.fee_bps),
             network_cost_lamports=self._fees.network_cost(),
             liquidity_ratio=Decimal(curve.t_units) / Decimal(units),
             rejection_reason=None,

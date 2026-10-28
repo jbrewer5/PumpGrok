@@ -65,6 +65,7 @@ class SimulateOut(ToolOutput):
             "size_too_small",
             "post_graduation_no_reserves",
             "data_stale",
+            "data_unavailable",
             "no_reserves",
         ]
         | None

@@ -102,6 +102,6 @@ Paper-only by default; live mode refuses to start unless every precondition in
 
 Assumptions and path differences the reader must not mistake for verified fact.
 
-- Curve decoding uses the verified 49-byte header in `src/pumpgrok/tools/onchain/curve_layout.py` (IDL field order, recorded in `tests/fixtures/rpc/bonding_curve/account.json`). Post-graduation PumpSwap fills are not modelled: a buy on a complete curve is rejected `post_graduation_no_reserves`.
+- Curve decoding uses the verified 49-byte header in `src/pumpgrok/tools/onchain/curve_layout.py`. A completed curve with a verified PumpSwap pool (IDL in `src/pumpgrok/tools/onchain/pumpswap_layout.py`, fixtures in `tests/fixtures/rpc/pumpswap/`) is priced from that pool in SOL. A non-SOL quote without a verified conversion is BLIND. An unpriced graduation still force-closes at the last curve price.
 - `run --once --replay` exercises the `PaperAdapter` path via `run_once_replay` in `src/pumpgrok/supervisor/scheduler/serve.py`, while `run_replay` in `src/pumpgrok/replay/runner.py` writes the checkpoint verdict row first and does not run the paper adapter.
 - `run --record` is not implemented and exits `EXIT_NOT_IMPLEMENTED` (`src/pumpgrok/cli/codes.py`) from `_run` in `src/pumpgrok/cli/verbs_state.py`.

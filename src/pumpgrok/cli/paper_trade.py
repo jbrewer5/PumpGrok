@@ -148,12 +148,6 @@ async def _preview(
         return _from_tool_error(verb, exc, placed=False)
     price = price_out.model_dump(mode="json")
     simulation = sim_out.model_dump(mode="json")
-    if side == "buy" and price.get("graduated") is True:
-        return _tool_error(
-            verb,
-            "post_graduation_no_reserves",
-            "bonding curve is complete; paper buys need curve reserves",
-        )
     if not simulation.get("would_fill"):
         reason = str(simulation.get("rejection_reason") or "simulation_rejected")
         return _tool_error(verb, reason, "simulation rejected the order; nothing was placed")
@@ -193,7 +187,7 @@ async def run_paper_trade(
     if isinstance(preview, int):
         return preview
     price, quote, simulation = preview
-    if side == "sell":
+    if side == "sell" and price.get("graduated") is not True:
         mark_store = LedgerStore(str(PAPER_LEDGER_PATH))
         try:
             record_curve_mark(
