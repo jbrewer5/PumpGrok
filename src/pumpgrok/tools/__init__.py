@@ -61,6 +61,7 @@ from pumpgrok.tools.notify.notifier import HttpxNotifier
 from pumpgrok.tools.notify.telegram import TelegramSender, read_telegram_token
 from pumpgrok.tools.notify.webhook import WebhookSender
 from pumpgrok.tools.onchain.authorities_tool import build_authorities_tool
+from pumpgrok.tools.onchain.curve_source import RpcCurveSource
 from pumpgrok.tools.onchain.deployer_history import build_deployer_history_tool
 from pumpgrok.tools.onchain.large_transfers import build_large_transfers_tool
 from pumpgrok.tools.onchain.lp_status import build_lp_status_tool
@@ -313,6 +314,7 @@ def build_operator_registry(
     price_source: PriceSource | None = None,
     p_drop: float = 0.0,  # CLI default: deterministic confirms; replay passes seeded curves
     seed: int | None = None,  # composition-root seed (INT-05); defaults to settings.replay.seed
+    bind_rpc_curve: bool = False,
 ) -> tuple[ToolRegistry, dict[str, BotManifest], httpx.AsyncClient]:
     """Compose the full 37-tool operator registry (TOOL-011, R63).
 
@@ -321,8 +323,9 @@ def build_operator_registry(
     paper adapter (TOOL-004, R64), so the CLI resolves
     through ``registry.find`` and I1 holds on every verb. ``ledger_path``
     overrides the store location: the CLI passes the canonical paper ledger.
-    ``price_source`` injects curve reads (tests pass scripted curves;
-    production paper trading binds the RPC curve reader in Phase 4).
+    ``price_source`` injects curve reads (tests pass scripted curves).
+    ``bind_rpc_curve`` attaches the verified RPC bonding-curve reader when no
+    source was injected. The paper CLI sets it. Other callers leave it off.
     ``p_drop`` fixes the confirmation-drop rate with a seeded stream
     (the CLI default ``0.0`` gives deterministic confirms; replay passes
     seeded curves with an explicit rate). ``seed`` is the explicit composition-root
@@ -347,6 +350,8 @@ def build_operator_registry(
     )
     store = LedgerStore(ledger_path if ledger_path is not None else data_dir / "ledger.sqlite")
     live = settings.effective_mode == "live"
+    if price_source is None and bind_rpc_curve:
+        price_source = RpcCurveSource(rpc)
     curves = _CachingPriceSource(price_source)
     budget = settings.risk
     ensure_paper_genesis(store, budget)

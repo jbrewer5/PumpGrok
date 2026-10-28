@@ -15,12 +15,12 @@ if TYPE_CHECKING:
     _VerbsAction = argparse._SubParsersAction[_Parser]
 
 
-def _add_seat(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--seat",
-        required=True,
-        help="calling seat; sniper and exit are refused (forbidden_owners)",
-    )
+def _add_seat(parser: argparse.ArgumentParser, *, help_text: str) -> None:
+    parser.add_argument("--seat", required=True, help=help_text)
+
+
+_STATE_SEAT_HELP = "calling seat; sniper and exit are refused (forbidden_owners)"
+_TRADE_SEAT_HELP = "calling seat; buy is sniper only, sell is exit only"
 
 
 def _add_paper_trade_flags(parser: argparse.ArgumentParser) -> None:
@@ -47,7 +47,7 @@ def _add_paper_trade_flags(parser: argparse.ArgumentParser) -> None:
         dest="approval_id",
         help="consumed ApprovalRecord id (apr-<ULID>)",
     )
-    _add_seat(parser)
+    _add_seat(parser, help_text=_TRADE_SEAT_HELP)
 
 
 def _add_run(verbs: _VerbsAction, mode_option: _Parser) -> None:
@@ -135,18 +135,18 @@ def _add_state(verbs: _VerbsAction, mode_option: _Parser) -> None:
     state = verbs.add_parser("state", parents=[mode_option], help="desk state verbs")
     state_cmd = state.add_subparsers(dest="cmd", required=True, metavar="STATE")
     state_status = state_cmd.add_parser("status", help="report desk status")
-    _add_seat(state_status)
+    _add_seat(state_status, help_text=_STATE_SEAT_HELP)
     state_halt = state_cmd.add_parser("halt", help="set or inspect the halt flag")
     state_halt.add_argument("--clear", action="store_true", help="clear the halt (human only)")
     state_halt.add_argument("--by", default=None, help="who clears the halt")
     state_halt.add_argument("--reason", default=None, help="why the halt changes")
-    _add_seat(state_halt)
+    _add_seat(state_halt, help_text=_STATE_SEAT_HELP)
     state_autonomy = state_cmd.add_parser("autonomy", help="set the autonomy mode (R40)")
     state_autonomy.add_argument(
         "policy", choices=("manual-ticket", "autonomous-paper"), help="autonomy policy"
     )
     state_autonomy.add_argument("--by", required=True, help="human setting the policy")
-    _add_seat(state_autonomy)
+    _add_seat(state_autonomy, help_text=_STATE_SEAT_HELP)
     state_resume = state_cmd.add_parser("resume", help="resume a seat from observe-only")
     state_resume.add_argument("--seat", required=True, help="seat to resume")
     state_resume.add_argument("--by", required=True, help="human resuming the seat")

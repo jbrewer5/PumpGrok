@@ -1,0 +1,30 @@
+{
+  "fixture": "bonding_curve_account",
+  "layout_status": "VERIFIED",
+  "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "discriminator_hex": "17b7f83760d8ac60",
+  "field_order": ["vtok", "vsol", "rtok", "rsol", "supply", "complete"],
+  "mint": "7dSJJHs6Ys1z39HWnXB6fDSjUgFDf4KXB8wd9KCQvpBd",
+  "account": "651GtgtXE6xhjzJVnWZWU1N7Q3S77b6GMXoyussUh9k5",
+  "pda_seed": "bonding-curve",
+  "pda_bump": 255,
+  "account_len": 166,
+  "account_sha256": "db6ff042aa277187111445ceb58173fa2f5ba0af9ff0932ff52f75a290b54f29",
+  "context_slot": 462542256,
+  "recorded_at": "2026-10-28T16:22:21Z",
+  "commitment": "confirmed",
+  "endpoint_host": "api.mainnet-beta.solana.com",
+  "account_b64": "F7f4N2DYrGCyn5KaqKEDAOnMDREKAAAAsgeAThejAgCzKBR6AAAAAACAxqR+jQMAAGv8Bu1nBRuZGPkqUpOZkIeSbGW+0pMjJq3OJ12zPmoqAAB44X/5z57yixXj1YMnQezngE4H1cl/Qu8z7V8FnHSSXx4AAAAAAAAAAAEAAAAAAAAAAK/hCxoAAAAAADak+ZYJAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  "decoded": {
+    "vtok": 1022170450010034,
+    "vsol": 43235790057,
+    "rtok": 742270450010034,
+    "rsol": 2048141491,
+    "supply": 1000000000000000,
+    "complete": false
+  },
+  "cross_check": {
+    "vtok_minus_rtok": 279900000000000,
+    "vsol_minus_rsol": 41187648566
+  }
+}

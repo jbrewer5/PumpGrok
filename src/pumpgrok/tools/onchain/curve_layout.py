@@ -1,13 +1,24 @@
 """Bonding-curve account decode over Solana RPC (STRUCT-002, B9, T-03-02-01).
 
-[ASSUMED] Anchor-style layout: an 8-byte discriminator, five little-endian
-u64 reserve counters, then a one-byte completion flag (0/1). The layout is
-NOT verified against a mainnet account: every test fixture built with
-:func:`encode_curve_fixture` is marked ASSUMED, and user confirmation of
-the layout is pending. Shared by ``market.price`` and ``onchain.lp_status``.
+Verified header (IDL order), read from a mainnet bonding-curve account owned by
+program ``6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P``:
 
-RPC only: this module performs no HTTP reads outside the injected RPC
-client and references no quote endpoint (R44, R46, R47).
+* 8-byte Anchor discriminator ``17b7f83760d8ac60`` (``account:BondingCurve``)
+* ``virtual_token_reserves`` u64
+* ``virtual_sol_reserves`` u64
+* ``real_token_reserves`` u64
+* ``real_sol_reserves`` u64
+* ``token_total_supply`` u64
+* ``complete`` bool (0 or 1)
+
+Live accounts are longer than this 49-byte header (166 bytes observed). The
+price reader decodes the header and ignores the trailing extension. The
+recorded account, its mint, and the PDA check live in
+``tests/fixtures/rpc/bonding_curve/account.json``.
+
+A swapped field order puts a token-scale integer in the SOL slot and fails
+the virtual-SOL cap below. RPC only: this module performs no HTTP reads and
+references no quote endpoint (R44, R46, R47).
 """
 
 from __future__ import annotations
@@ -19,26 +30,36 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict
 
-from pumpgrok.core.units import lamports_to_sol, sol_to_lamports
+from pumpgrok.core.units import LAMPORTS_PER_SOL, lamports_to_sol, sol_to_lamports
 from pumpgrok.tools._common import UNITS_PER_TOKEN
 
 _CURVE_STRUCT = struct.Struct("<8sQQQQQB")
 CURVE_ACCOUNT_SIZE = _CURVE_STRUCT.size
 
-#: Bonding-curve layout verification state (R65). ASSUMED until a live probe
-#: against mainnet bonding-curve accounts decodes under this layout and a
-#: human reviews the probe record in tests/fixtures/rpc/bonding_curve/.
-#: While ASSUMED, no paper entry may consume an RPC-derived price: the
-#: PaperAdapter refuses with data_unavailable (fail closed).
-LAYOUT_STATUS: Final[str] = "ASSUMED"
+#: pump.fun program. Bonding-curve accounts are owned by this program.
+PUMP_PROGRAM_ID: Final[str] = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+#: sha256("account:BondingCurve")[:8], confirmed on the recorded mainnet account.
+EXPECTED_DISCRIMINATOR: Final[bytes] = bytes.fromhex("17b7f83760d8ac60")
+
+#: Layout verification state (R65). VERIFIED against the recorded account in
+#: tests/fixtures/rpc/bonding_curve/. RPC-derived reserves may price a paper
+#: entry. A future mismatch fails closed: decode rejects the account and the
+#: adapter writes no fill.
+LAYOUT_STATUS: Final[str] = "VERIFIED"
 
 #: Lamports of real SOL at which the curve is considered complete (catalog:
-#: 85 SOL, the retired oracle ``src/monitor.py:30``). [ASSUMED] threshold.
+#: 85 SOL, the retired oracle ``src/monitor.py:30``).
 COMPLETION_SOL_LAMPORTS = sol_to_lamports(Decimal(85))
+
+#: Virtual SOL above this is not a pump.fun bonding curve. The cap is far above
+#: observed reserves (completion is near 85 SOL of real SOL) and below the
+#: token-scale integers a swapped field order would place in this slot.
+MAX_VIRTUAL_SOL_LAMPORTS: Final[int] = 10_000 * LAMPORTS_PER_SOL
 
 
 class CurveDecodeError(ValueError):
-    """The account bytes do not match the ASSUMED curve layout."""
+    """The account bytes do not match the verified curve header."""
 
 
 class CurveState(BaseModel):
@@ -55,28 +76,35 @@ class CurveState(BaseModel):
 
 
 def decode_curve_account(data: bytes) -> CurveState:
-    """Decode raw account bytes with the ASSUMED layout.
+    """Decode the verified header. Trailing bytes (creator and extensions) are ignored.
 
-    Raises :class:`CurveDecodeError` on any shape mismatch (wrong length,
-    completion flag outside ``{0, 1}``); callers map it to ``DataStale``.
+    Raises :class:`CurveDecodeError` on a short buffer, a wrong discriminator,
+    a completion flag outside ``{0, 1}``, a zero price, or reserves that fail
+    the SOL-scale cap (the swapped-field trap). Callers map it to ``DataStale``.
     """
-    if len(data) != CURVE_ACCOUNT_SIZE:
-        raise CurveDecodeError(f"curve account size {len(data)} != ASSUMED {CURVE_ACCOUNT_SIZE}")
+    if len(data) < CURVE_ACCOUNT_SIZE:
+        raise CurveDecodeError(
+            f"curve account size {len(data)} < verified header {CURVE_ACCOUNT_SIZE}"
+        )
+    header = data[:CURVE_ACCOUNT_SIZE]
+    if header[:8] != EXPECTED_DISCRIMINATOR:
+        raise CurveDecodeError(
+            f"curve discriminator {header[:8].hex()} != {EXPECTED_DISCRIMINATOR.hex()}"
+        )
     try:
-        (_, vsol, vtok, rsol, rtok, supply, complete) = _CURVE_STRUCT.unpack(data)
+        (_, vtok, vsol, rtok, rsol, supply, complete) = _CURVE_STRUCT.unpack(header)
     except struct.error as exc:
         raise CurveDecodeError(f"curve account unpack failed: {type(exc).__name__}") from exc
     if complete not in (0, 1):
         raise CurveDecodeError(f"curve completion flag not boolean: {complete!r}")
-    for name, value in (
-        ("virtual_sol", vsol),
-        ("virtual_token", vtok),
-        ("real_sol", rsol),
-        ("real_token", rtok),
-        ("supply", supply),
-    ):
-        if value == 0 and name in ("virtual_sol", "virtual_token", "supply"):
-            raise CurveDecodeError(f"curve reserve {name} is zero; price undefined")
+    if vsol == 0 or vtok == 0 or supply == 0:
+        raise CurveDecodeError("curve reserve is zero; price undefined")
+    if vsol > MAX_VIRTUAL_SOL_LAMPORTS:
+        raise CurveDecodeError("virtual sol reserve exceeds the verified bonding-curve range")
+    if rsol > vsol:
+        raise CurveDecodeError("real sol reserve exceeds virtual sol")
+    if rtok > vtok:
+        raise CurveDecodeError("real token reserve exceeds virtual token")
     return CurveState(
         virtual_sol_reserves_lamports=vsol,
         virtual_token_reserves_units=vtok,
@@ -111,24 +139,23 @@ def encode_curve_fixture(
     total_supply_units: int,
     complete: bool,
 ) -> bytes:
-    """Build [ASSUMED]-layout account bytes for tests. Never used in production."""
+    """Build verified-header account bytes for tests. Never used on the wire."""
     return _CURVE_STRUCT.pack(
-        b"ASSUMED\x00",
-        virtual_sol_reserves_lamports,
+        EXPECTED_DISCRIMINATOR,
         virtual_token_reserves_units,
-        real_sol_reserves_lamports,
+        virtual_sol_reserves_lamports,
         real_token_reserves_units,
+        real_sol_reserves_lamports,
         total_supply_units,
         1 if complete else 0,
     )
 
 
 def curve_price_sol_per_token(state: CurveState) -> Decimal:
-    """SOL per token from virtual reserves (vendor ``price_from_reserves`` math).
+    """SOL per whole token from virtual reserves.
 
-    The ported float expression ``(vsol / 1e9) / (vtok / 1e6)`` is evaluated
-    here in :class:`Decimal` at the wrapper boundary; the vendor module keeps
-    its float form untouched (characterization pins).
+    ``(vsol / 1e9) / (vtok / 1e6)`` in :class:`Decimal`. ``vtok`` is base units
+    (6 decimals). The result is SOL per token, never a float.
     """
     return lamports_to_sol(
         Decimal(state.virtual_sol_reserves_lamports)
@@ -153,9 +180,8 @@ def curve_market_cap_lamports(state: CurveState) -> int:
 def rpc_curve_price_allowed(*, curve_source: str) -> bool:
     """True when a price from ``curve_source`` may price a paper entry.
 
-    RPC-derived reserves are untrusted bytes until the layout is VERIFIED
-    (T-04-08): while ``LAYOUT_STATUS`` is ASSUMED they fail closed with
-    ``data_unavailable`` at the entry gate. Fixture, rest and pumpportal
-    integer ticks never pass through this layout, so replay is unaffected.
+    RPC reserves are allowed while ``LAYOUT_STATUS`` is VERIFIED. Any other
+    status fail-closes RPC entries with ``data_unavailable``. Fixture, rest
+    and pumpportal integer ticks never pass through this layout.
     """
     return not (curve_source == "rpc" and LAYOUT_STATUS != "VERIFIED")

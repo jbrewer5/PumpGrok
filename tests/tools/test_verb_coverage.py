@@ -2,7 +2,7 @@
 
 Registry level: the five exec tools resolve through ``build_registry`` find
 and run against the paper adapter (scripted curves, ``p_drop=0.0`` for
-deterministic fills). CLI level: paper buy/sell (simulate then place),
+deterministic fills). CLI level: paper buy/sell fail closed without a curve,
 state halt --clear/autonomy/resume, killswitch clear, ticket next/create/list,
 and verify run end to end with exit 0 and JSON. The remaining exit-5 list is
 pinned to the 04-09 handoff exactly.
@@ -34,8 +34,25 @@ from pumpgrok.ledger.tickets import allocate_ticket
 from pumpgrok.replay.clock import WallClock, format_ts_utc
 from pumpgrok.replay.rng import make_rng
 from pumpgrok.tools import build_operator_registry
+from pumpgrok.tools.onchain.rpc import RpcClient, RpcError
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _silence_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Curve reads return no account, so a paper verb fails closed offline."""
+
+    async def call(self: RpcClient, method: str, params: list[object]) -> object:
+        del self, params
+        if method == "getAccountInfo":
+            return {"context": {"slot": 1}, "value": None}
+        if method == "getRecentPrioritizationFees":
+            return [{"slot": 1, "prioritizationFee": 1}]
+        raise RpcError(f"unexpected method {method}")
+
+    monkeypatch.setattr(RpcClient, "call", call)
+
+
 MINT = "So11111111111111111111111111111111111111112"
 S0 = 42_000_000_000
 T0 = 766_428_571_428_571
@@ -332,11 +349,11 @@ class TestServedVerbCoverage:
             seat,
         ]
 
-    def test_paper_buy_refused_unavailable_no_fill(
+    def test_paper_buy_without_a_curve_writes_no_fill(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The CLI cannot price a fill: the buy is refused as unavailable (exit 1) and no
-        # FillRecorded or OrderPlaced is written (formerly a runtime fill, exit 0).
+        # No curve account: the buy fails closed (exit 1) and writes no fill.
+        _silence_rpc(monkeypatch)
         monkeypatch.chdir(tmp_path)
         store = LedgerStore(str(tmp_path / "var" / "ledger.sqlite"))
         try:
@@ -348,17 +365,17 @@ class TestServedVerbCoverage:
         assert code == 1
         payload = json.loads(out)
         assert payload["ok"] is False
-        assert payload["code"] == "unavailable"
+        assert payload["code"] == "data_stale"
         assert "Traceback" not in err
         kinds = _ledger_kinds(tmp_path)
         assert "FillRecorded" not in kinds
         assert "OrderPlaced" not in kinds
 
-    def test_paper_sell_after_buy_refused_unavailable_no_fill(
+    def test_paper_sell_after_buy_without_a_curve_writes_no_fill(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Both legs are refused as unavailable (exit 1); no FillRecorded or OrderPlaced is
-        # written (formerly a buy then a sell, both exit 0).
+        # Both legs fail closed when the curve account is missing; nothing is filled.
+        _silence_rpc(monkeypatch)
         monkeypatch.chdir(tmp_path)
         for side in ("buy", "sell"):
             store = LedgerStore(str(tmp_path / "var" / "ledger.sqlite"))
@@ -370,7 +387,7 @@ class TestServedVerbCoverage:
             code, out, err = _run(flags)
             assert code == 1
             payload = json.loads(out)
-            assert payload["code"] == "unavailable"
+            assert payload["code"] == "data_stale"
             assert "Traceback" not in err
         kinds = _ledger_kinds(tmp_path)
         assert "FillRecorded" not in kinds

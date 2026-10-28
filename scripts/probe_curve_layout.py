@@ -2,9 +2,10 @@
 """Read-only bonding-curve layout probe (INT-10, R65).
 
 One ``getAccountInfo`` call against the configured public Solana RPC for a
-known bonding-curve account, decoded under the ASSUMED layout in
-``src/pumpgrok/tools/onchain/curve_layout.py`` (8-byte discriminator, five
-little-endian u64 reserve counters, one-byte completion flag).
+known bonding-curve account, decoded under the verified header in
+``src/pumpgrok/tools/onchain/curve_layout.py`` (8-byte discriminator, then
+virtual token, virtual SOL, real token, real SOL, supply, completion flag).
+Accounts may be longer than the 49-byte header; the tail is not priced.
 
 Read-only by construction: stdlib ``urllib`` POST of a single ``getAccountInfo``
 body, no keys loaded, no wallet, no signing path. On success the decoded
@@ -77,11 +78,16 @@ def _rpc_get_account(endpoint: str, account: str, commitment: str, timeout: floa
     return payload
 
 
+# Virtual SOL above this is not a bonding curve. A swapped field order puts a
+# token-scale integer here and must not be recorded as VERIFIED.
+_MAX_VIRTUAL_SOL_LAMPORTS = 10_000 * 1_000_000_000
+
+
 def _decode_account(raw: bytes) -> dict:
-    """Decode raw account bytes under the ASSUMED layout; raises on mismatch."""
-    if len(raw) != _EXPECTED_SIZE:
-        raise ValueError(f"curve account size {len(raw)} != ASSUMED {_EXPECTED_SIZE}")
-    (disc, vsol, vtok, rsol, rtok, supply, complete) = _CURVE_STRUCT.unpack(raw)
+    """Decode the verified header; raises on a short buffer or an insane reserve."""
+    if len(raw) < _EXPECTED_SIZE:
+        raise ValueError(f"curve account size {len(raw)} < verified header {_EXPECTED_SIZE}")
+    (disc, vtok, vsol, rtok, rsol, supply, complete) = _CURVE_STRUCT.unpack(raw[:_EXPECTED_SIZE])
     if complete not in (0, 1):
         raise ValueError(f"curve completion flag not boolean: {complete!r}")
     for name, value in (
@@ -93,12 +99,18 @@ def _decode_account(raw: bytes) -> dict:
     ):
         if value == 0 and name in ("virtual_sol", "virtual_token", "supply"):
             raise ValueError(f"curve reserve {name} is zero; price undefined")
+    if vsol > _MAX_VIRTUAL_SOL_LAMPORTS:
+        raise ValueError("virtual sol reserve exceeds the verified bonding-curve range")
+    if rsol > vsol:
+        raise ValueError("real sol reserve exceeds virtual sol")
+    if rtok > vtok:
+        raise ValueError("real token reserve exceeds virtual token")
     return {
         "discriminator_hex": disc.hex(),
-        "virtual_sol_reserves_lamports": vsol,
-        "virtual_token_reserves_units": vtok,  # pragma: allowlist secret: on-chain reserve count
-        "real_sol_reserves_lamports": rsol,
-        "real_token_reserves_units": rtok,
+        "vsol": vsol,
+        "vtok": vtok,
+        "rsol": rsol,
+        "rtok": rtok,
         "total_supply_units": supply,
         "complete": bool(complete),
     }
