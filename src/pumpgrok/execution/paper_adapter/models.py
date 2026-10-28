@@ -29,6 +29,11 @@ class CurveSnapshot(BaseModel):
     # Recorded time of the reading (fixture tick time). None for a live read, which is
     # priced at the moment it is taken.
     ts: float | None = None
+    # PumpSwap fills carry the verified venue fee. None keeps the curve fee model.
+    fee_bps: int | None = None
+    # Quote mint has no verified SOL conversion. The adapter must not price it.
+    blind: bool = False
+    venue: str = "curve"
 
 
 class PriceSource(Protocol):

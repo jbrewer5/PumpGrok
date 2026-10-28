@@ -49,7 +49,7 @@ class LiquidityOut(ToolOutput):
 LIQUIDITY_SPEC = ToolSpec(
     name="market.liquidity",
     description=(
-        "Pool depth from the on-chain bonding-curve reserves (ASSUMED "
+        "Pool depth from the on-chain bonding-curve reserves (verified "
         "layout) with price impact for a given order size."
     ),
     input_model=LiquidityIn,

@@ -34,11 +34,6 @@ _EXIT_BY_CODE = {
     "live_gate": EXIT_LIVE,
 }
 
-_TRADE_UNAVAILABLE = (
-    "trade commands need a verified curve price source; no paper fills run from the CLI "
-    "until the Phase 4 curve reader is verified"
-)
-
 _TOOLS_HELP = (
     "usage: pumpgrok tools <id> [--help]",
     "",

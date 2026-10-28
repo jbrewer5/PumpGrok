@@ -7,8 +7,10 @@ one sell through the exit seat's granted ``exec.place``. A sell the venue report
 ``unknown`` is never retried: that position is held out of later passes (R18,
 single-send), so the desk does not sell it twice.
 
-A position whose curve has completed (graduated) cannot take an ordinary order, so
-it is closed first, at its last pre-graduation reserves, with reason ``graduated``.
+A completed curve with no PumpSwap price cannot take an ordinary order, so it is
+closed first, at its last pre-graduation reserves, with reason ``graduated``.
+A curve the price source replaces with a pool snapshot stays open and is marked
+from that pool.
 
 A position is identified by its opening ``PositionOpened`` sequence, not only its
 mint. A re-entry in the same mint therefore starts a new position with a fresh entry

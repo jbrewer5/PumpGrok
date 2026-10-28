@@ -28,7 +28,11 @@ from pumpgrok.core.tool import RetryPolicy
 from pumpgrok.replay.clock import FixtureClock
 from pumpgrok.tools import build_registry
 from pumpgrok.tools.market.price import PriceIn, build_price_tool
-from pumpgrok.tools.onchain.curve_layout import CURVE_ACCOUNT_SIZE, encode_curve_fixture
+from pumpgrok.tools.onchain.curve_layout import (
+    CURVE_ACCOUNT_SIZE,
+    PUMP_PROGRAM_ID,
+    encode_curve_fixture,
+)
 from pumpgrok.tools.onchain.rpc import RpcClient
 
 START = 1469918176.385
@@ -68,7 +72,7 @@ def _rpc_for(payload_b64: str | None, *, slot: int | None = 123) -> RpcClient:
                     "data": [payload_b64, "base64"],
                     "executable": False,
                     "lamports": 1,
-                    "owner": "CurveProgram11111111111111111111111111111111",
+                    "owner": PUMP_PROGRAM_ID,
                     "rentEpoch": 1,
                 },
             }

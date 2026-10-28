@@ -1,10 +1,21 @@
 {
   "fixture": "bonding_curve_probe",
-  "layout_status": "ASSUMED",
+  "layout_status": "VERIFIED",
   "endpoint": "https://api.mainnet-beta.solana.com",
-  "account": null,
+  "account": "651GtgtXE6xhjzJVnWZWU1N7Q3S77b6GMXoyussUh9k5",
   "commitment": "confirmed",
-  "probed_at": "2026-10-25T11:07:04Z",
-  "decoded": null,
-  "probe_error": "no bonding-curve account configured; set BONDING_CURVE_ACCOUNT or pass --account <pubkey>; no RPC call made; layout stays ASSUMED"
+  "probed_at": "2026-10-28T16:22:21Z",
+  "context_slot": 462542257,
+  "account_len": 166,
+  "account_sha256": "db6ff042aa277187111445ceb58173fa2f5ba0af9ff0932ff52f75a290b54f29",
+  "decoded": {
+    "discriminator_hex": "17b7f83760d8ac60",
+    "vsol": 43235790057,
+    "vtok": 1022170450010034,
+    "rsol": 2048141491,
+    "rtok": 742270450010034,
+    "total_supply_units": 1000000000000000,
+    "complete": false
+  },
+  "probe_error": null
 }

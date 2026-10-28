@@ -124,6 +124,18 @@ class _ConfirmMixin:
                 source=ledger_source,
                 correlation_id=correlation_id,
             )
+        if curve1.blind:
+            self._inflight.discard(order_id)
+            raise await self._reject(
+                request,
+                request.decision_id,
+                "data_unavailable",
+                "BLIND: quote mint has no verified SOL conversion",
+                stage="CONFIRMING",
+                order_id=order_id,
+                source=ledger_source,
+                correlation_id=correlation_id,
+            )
         if request.side is Side.BUY and not rpc_curve_price_allowed(curve_source=curve1.source):
             self._inflight.discard(order_id)
             raise await self._reject(

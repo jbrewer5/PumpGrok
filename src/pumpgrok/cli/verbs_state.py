@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pumpgrok.cli.codes import (
-    _TRADE_UNAVAILABLE,
     DATASET_NAME_RE,
     EXIT_CONFIG,
     EXIT_LIVE,
@@ -27,6 +26,7 @@ from pumpgrok.cli.errors import (
     _say,
     _tool_error,
 )
+from pumpgrok.cli.paper_trade import refuse_trade_seat, run_paper_trade
 from pumpgrok.cli.validators import _human_by, _mint_approval_id, _utc_now, size_sol_to_lamports
 from pumpgrok.cli.wiring import (
     _call_use,
@@ -36,7 +36,7 @@ from pumpgrok.cli.wiring import (
 )
 from pumpgrok.config.settings import ConfigError, Settings, health_port
 from pumpgrok.core.approvals import ApprovalRecord
-from pumpgrok.core.ids import IdFactory
+from pumpgrok.core.ids import IdFactory, mint_approval_id
 from pumpgrok.core.tool import Tool
 from pumpgrok.execution.live.live_gate import LiveGate, refusal_lines
 from pumpgrok.ledger.active_set import read_active_param_set
@@ -151,26 +151,46 @@ def _skip_cycle(source: Path, settings: Settings) -> int:
 
 
 def _paper(args: argparse.Namespace, settings: Settings) -> int:
-    """Paper trade: seat authorization first, then refuse with code ``unavailable``.
+    """Paper trade through quote, simulate, and one place.
 
-    The forbidden-owner guard and the registry grant check (``find``) run before
-    the refusal, so forbidden and operator seats keep their existing codes. Only a
-    seat allowed to trade reaches the refusal. No tool is invoked and nothing is
-    written: no curve price source is bound on the CLI and the RPC curve layout is
-    ASSUMED.
+    Buys are sniper only and sells are exit only. The order is priced from the
+    verified bonding-curve header. One decision id is minted per invocation.
+    A repeated invocation is a new decision and needs its own approval. An
+    unclear place is reported as UNKNOWN RESULT and is not retried.
     """
     verb = f"paper {args.cmd}"
-    refused = _refuse_forbidden_seat(args.seat, verb)
+    refused = refuse_trade_seat(args.seat, args.cmd, verb)
     if refused is not None:
         return refused
-    if size_sol_to_lamports(args.size_sol) > settings.risk.paper_equity_lamports:
+    size_lamports = size_sol_to_lamports(args.size_sol)
+    if size_lamports > settings.risk.paper_equity_lamports:
         _say(sys.stderr, "usage error: --size-sol exceeds paper equity")
         return EXIT_CONFIG
+    # Fresh decision per invocation. The apr- mint uses the OS-entropy root in
+    # core/ids.py; the 26-character ULID is the decision id (R23).
+    decision_id = mint_approval_id()[4:]
 
-    async def use(_tools: list[Tool]) -> int:
-        return _tool_error(verb, "unavailable", _TRADE_UNAVAILABLE)
+    async def use(tools: list[Tool]) -> int:
+        return await run_paper_trade(
+            tools,
+            verb=verb,
+            side=args.cmd,
+            ticket=args.ticket,
+            mint=args.mint,
+            size_lamports=size_lamports,
+            slippage_bps=args.slippage_bps,
+            approval_id=args.approval_id,
+            decision_id=decision_id,
+        )
 
-    return _run_wired(verb, args.seat, settings, ("exec.simulate", "exec.place"), use)
+    return _run_wired(
+        verb,
+        args.seat,
+        settings,
+        ("market.price", "onchain.priority_fee", "exec.quote", "exec.simulate", "exec.place"),
+        use,
+        bind_rpc_curve=True,
+    )
 
 
 def _set_autonomy(policy: str, by: str, settings: Settings) -> int:

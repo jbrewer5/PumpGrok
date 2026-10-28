@@ -27,6 +27,7 @@ from pumpgrok.cli import main
 from pumpgrok.core.errors import PermissionDenied
 from pumpgrok.core.side_effect import SideEffect
 from pumpgrok.ledger.store import LedgerStore
+from pumpgrok.tools.onchain.rpc import RpcClient, RpcError
 from registry_harness import build_full_registry, resolve
 
 TICKET = "SOL-20260101-001"
@@ -123,6 +124,15 @@ def test_paper_write_resolves_with_paper_write_ceiling_non_vacuous(
 def test_cli_paper_buy_without_valid_approval_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seat: str
 ) -> None:
+    async def call(self: RpcClient, method: str, params: list[object]) -> object:
+        del self, params
+        if method == "getAccountInfo":
+            return {"context": {"slot": 1}, "value": None}
+        if method == "getRecentPrioritizationFees":
+            return [{"slot": 1, "prioritizationFee": 1}]
+        raise RpcError(f"unexpected method {method}")
+
+    monkeypatch.setattr(RpcClient, "call", call)
     monkeypatch.chdir(tmp_path)
     store = LedgerStore(str(tmp_path / "ledger.sqlite"))
     assert store.count() == 0

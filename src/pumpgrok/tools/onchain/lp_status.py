@@ -1,4 +1,4 @@
-"""onchain.lp_status: curve completion from the ASSUMED account (TOOL-002, B9).
+"""onchain.lp_status: curve completion from the verified header (TOOL-002, B9).
 
 Reads the same curve account as ``market.price`` through
 :mod:`pumpgrok.tools.onchain.curve_layout` (never REST). LP-mint fields
@@ -48,7 +48,7 @@ LP_STATUS_SPEC = ToolSpec(
     name="onchain.lp_status",
     description=(
         "Liquidity stage from the on-chain bonding-curve account "
-        "(ASSUMED layout); LP-mint lock fields are unwired."
+        "(verified header); LP-mint lock fields are unwired."
     ),
     input_model=LpStatusIn,
     output_model=LpStatusOut,

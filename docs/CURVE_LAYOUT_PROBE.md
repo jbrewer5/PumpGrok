@@ -1,8 +1,7 @@
 # Bonding-curve layout probe (INT-10, R65)
 
-Status: ASSUMED
-Error: no bonding-curve account configured; set BONDING_CURVE_ACCOUNT or pass --account <pubkey>; no RPC call made; layout stays ASSUMED
+Status: VERIFIED
 
 Endpoint: https://api.mainnet-beta.solana.com
+Account: 651GtgtXE6xhjzJVnWZWU1N7Q3S77b6GMXoyussUh9k5
 Method: getAccountInfo (read-only, no keys)
-Layout: ASSUMED until a live probe decodes under it; RPC-derived entries fail closed with data_unavailable.

@@ -119,13 +119,11 @@ post_buy(S, T, x)     = (S + x, T - buy_out(S,T,x))            reserves after th
 
 The vendor divides `virtual_sol_reserves/1e9` by `virtual_token_reserves/1e6` to get SOL per token (executor.py:89-91); the ported `CurveQuote.spot()` characterization test converts the integer `spot` back to that unit (`x 1e3`) and matches the vendor to 12 significant figures. The fallback `market_cap / TOTAL_SUPPLY` (executor.py:93-96) is used only to produce a `spot` for mark-to-market when reserves are absent; it never produces a fill, because a fill without reserves has no impact model (`OrderRejected reason=no_reserves`).
 
-Graduation (R8, R38): the vendor treats the curve as complete at `CURVE_COMPLETION_SOL = 85.0` (monitor.py:30) and the REST payload carries `complete` [INFERENCE: field name from pump.fun frontend API, not read by vendor code]. Post-graduation venues are not modelled: D8 keeps data sources exactly as integrated today and none of them exposes post-graduation pool reserves. Therefore:
+Graduation (R8, R38, amended): the curve is complete at 85 SOL of real quote or when the account flag is set. A verified PumpSwap pool (official IDL, vault balances plus `virtual_quote_reserves`) now prices that mint in SOL. When that pool decodes and its quote converts to SOL through a verified pool, paper buys and sells use the pool, and an open position keeps being marked from the pool instead of closing. Replay fixtures that only carry curve ticks, and a live curve whose pool cannot be priced, still follow the original rule:
 
-- a BUY whose `CurveState.complete` is true at decision time or at `CONFIRMING` is rejected `OrderRejected reason=post_graduation_no_reserves`;
-- an OPEN position whose token graduates (the first tick with `complete == true`, or `S >= CURVE_COMPLETION_SOL` when `complete` is absent) is force-closed by the adapter at the last pre-graduation curve price (`sell_out` on the last `complete == false` reserves, net of venue fee) with `PositionClosed reason=graduated`; its MTM is frozen at that value (`mtm_frozen = true`) and no further `MarkToMarket` entry is produced for it. No order and no approval is involved; the close is adapter-internal and appends `Escalation(kind=graduated)`;
-- a SELL on a graduated token is impossible because the position no longer exists.
-
-This is a documented limitation (section 11.5): paper results stop at graduation.
+- a BUY whose snapshot is a completed curve with no pool price is rejected `post_graduation_no_reserves`;
+- an OPEN position in that case is force-closed at the last pre-graduation curve price with `PositionClosed reason=graduated` and MTM frozen;
+- a quote mint that is not SOL and has no verified SOL conversion is `BLIND` (`data_unavailable`), never a guessed rate.
 
 ### 2.3 Fee model (`fees.py`)
 

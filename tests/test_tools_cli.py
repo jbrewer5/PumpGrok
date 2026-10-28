@@ -25,6 +25,7 @@ from pumpgrok.ledger.store import LedgerStore
 from pumpgrok.ledger.tickets import allocate_ticket
 from pumpgrok.replay.clock import WallClock, format_ts_utc
 from pumpgrok.replay.rng import make_rng
+from pumpgrok.tools.onchain.rpc import RpcClient, RpcError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -92,7 +93,7 @@ class TestPaperRegistryPath:
     """Task 1 tracer: paper buy/sell resolve through the registry (TOOL-011, R63)."""
 
     @pytest.mark.parametrize("side", ["buy", "sell"])
-    def test_paper_operator_seat_refused_by_registry_as_json(
+    def test_paper_operator_seat_refused_before_tools(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -105,33 +106,54 @@ class TestPaperRegistryPath:
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert payload["ok"] is False
-        assert payload["code"] == "permission_denied"
+        assert payload["code"] == "seat_may_trade"
         assert "Traceback" not in captured.err
+        assert _ledger_kinds(tmp_path) == []
 
     @pytest.mark.parametrize("side", ["buy", "sell"])
-    def test_paper_writer_seat_refused_unavailable(
+    def test_paper_writer_seat_matches_its_side(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         side: str,
     ) -> None:
-        # bot-04-sniper holds exec.simulate and exec.place, so the seat guard passes and
-        # the trade is refused as unavailable (exit 1). The approval gate is no longer
-        # reachable from the CLI; no ledger event is written.
+        # bot-04-sniper may buy and is refused on sell. A buy with no curve account
+        # fails closed before a fill. Nothing is placed.
+        async def call(self: RpcClient, method: str, params: list[object]) -> object:
+            del self, params
+            if method == "getAccountInfo":
+                return {"context": {"slot": 1}, "value": None}
+            if method == "getRecentPrioritizationFees":
+                return [{"slot": 1, "prioritizationFee": 1}]
+            raise RpcError(f"unexpected method {method}")
+
+        monkeypatch.setattr(RpcClient, "call", call)
         monkeypatch.chdir(tmp_path)
         code = main(_trade_flags("bot-04-sniper", side=side))
         assert code == 1
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert payload["ok"] is False
-        assert payload["code"] == "unavailable"
-        assert "verified curve price source" in payload["message"]
-        assert _ledger_kinds(tmp_path) == []
+        if side == "sell":
+            assert payload["code"] == "seat_may_trade"
+        else:
+            assert payload["code"] != "seat_may_trade"
+        assert "FillRecorded" not in _ledger_kinds(tmp_path)
+        assert "OrderPlaced" not in _ledger_kinds(tmp_path)
 
     def test_paper_rejections_write_no_order_placed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        async def call(self: RpcClient, method: str, params: list[object]) -> object:
+            del self, params
+            if method == "getAccountInfo":
+                return {"context": {"slot": 1}, "value": None}
+            if method == "getRecentPrioritizationFees":
+                return [{"slot": 1, "prioritizationFee": 1}]
+            raise RpcError(f"unexpected method {method}")
+
+        monkeypatch.setattr(RpcClient, "call", call)
         monkeypatch.chdir(tmp_path)
         for seat in ("desk", "bot-04-sniper", "sniper", "exit"):
             assert main(_trade_flags(seat)) == 1
@@ -160,7 +182,7 @@ class _ScriptedCurves:
 
 
 class TestPaperFillPath:
-    """Task 3: sniper buy/sell refused as unavailable; the CLI cannot fill (exit 1)."""
+    """A paper leg with no curve account fails closed and writes no fill."""
 
     def _fill_flags(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, side: str, size_sol: str
@@ -219,21 +241,29 @@ class TestPaperFillPath:
             seat,
         ]
 
-    def test_sniper_buy_then_sell_refused_unavailable_no_fill(
+    def test_sniper_buy_then_sell_without_a_curve_writes_no_fill(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # Same buy-then-sell flow as the former fill test: both legs are refused as
-        # unavailable (exit 1) and no FillRecorded or OrderPlaced is written.
+        # No curve account: both legs fail closed (exit 1) and write no fill.
+        async def call(self: RpcClient, method: str, params: list[object]) -> object:
+            del self, params
+            if method == "getAccountInfo":
+                return {"context": {"slot": 1}, "value": None}
+            if method == "getRecentPrioritizationFees":
+                return [{"slot": 1, "prioritizationFee": 1}]
+            raise RpcError(f"unexpected method {method}")
+
+        monkeypatch.setattr(RpcClient, "call", call)
         monkeypatch.chdir(tmp_path)
         for side, size_sol in (("buy", "0.2"), ("sell", "0.1")):
             flags = self._fill_flags(tmp_path, monkeypatch, side=side, size_sol=size_sol)
             assert main(flags) == 1
             payload = json.loads(capsys.readouterr().out)
             assert payload["ok"] is False
-            assert payload["code"] == "unavailable"
+            assert payload["code"] == "data_stale"
         kinds = _ledger_kinds(tmp_path)
         assert "FillRecorded" not in kinds
         assert "OrderPlaced" not in kinds

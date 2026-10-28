@@ -10,6 +10,7 @@ from pumpgrok.core.adapter import Fill, FillStatus, OrderRequest, Side
 from pumpgrok.core.errors import OrderRejectedError
 from pumpgrok.core.idempotency import exec_place_key
 from pumpgrok.execution.curve_math import buy_out, impact_buy
+from pumpgrok.execution.fees import take_fee
 from pumpgrok.execution.paper_adapter.models import CurveSnapshot, _BuyConfirmed, _BuyQuote
 from pumpgrok.risk.engine import RiskDecision, order_hash_for
 from pumpgrok.tools.onchain.curve_layout import rpc_curve_price_allowed
@@ -247,6 +248,16 @@ class _BuyMixin:
                 correlation_id=correlation_id,
             )
         # The source gate prices entries only: a stop-loss sell must still fill (INV-R-16).
+        if curve0.blind:
+            raise await self._reject(
+                request,
+                request.decision_id,
+                "data_unavailable",
+                "BLIND: quote mint has no verified SOL conversion",
+                stage="ACCEPTED",
+                source=ledger_source,
+                correlation_id=correlation_id,
+            )
         if request.side is Side.BUY and not rpc_curve_price_allowed(curve_source=curve0.source):
             raise await self._reject(
                 request,
@@ -346,7 +357,7 @@ class _BuyMixin:
             )
         filled = min(size, self._fill_cap(curve0.s_lamports))
         fraction = Decimal(filled) / Decimal(size)
-        venue_fee = self._fees.venue_fee(filled)
+        venue_fee = take_fee(self._fees.venue_fee_bps, filled, curve0.fee_bps)
         x_net = filled - venue_fee
         slippage_bps = self._slippage_bps(request)
         out0 = buy_out(curve0.s_lamports, curve0.t_units, x_net)
@@ -439,7 +450,7 @@ class _BuyMixin:
             # up to it, priced at the decision reserves with a threshold to match.
             filled = cap_now
             fraction = Decimal(filled) / Decimal(quote.size)
-            venue_fee = self._fees.venue_fee(filled)
+            venue_fee = take_fee(self._fees.venue_fee_bps, filled, curve0.fee_bps)
             x_net = filled - venue_fee
             out0 = buy_out(curve0.s_lamports, curve0.t_units, x_net)
             threshold = out0 * (10_000 - quote.slippage_bps) // 10_000
@@ -518,7 +529,7 @@ class _BuyMixin:
                     "curve_before_t": curve0.t_units,
                     "curve_after_s": curve1.s_lamports,
                     "curve_after_t": curve1.t_units,
-                    "route": "curve",
+                    "route": curve0.venue if curve0.venue == "pumpswap" else "curve",
                     "realised_slippage_bps": slipped,
                 },
             }

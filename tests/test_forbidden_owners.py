@@ -1,4 +1,10 @@
-"""forbidden_owners enforcement: sniper/exit seats refused (STRUCT-005, T-02-10)."""
+"""Seat rules: cron state verbs still refuse sniper/exit; paper trades do not.
+
+``jobs.yaml`` ``forbidden_owners`` keeps scheduled jobs off the only seats that
+may send. Paper buys are sniper-only and paper sells are exit-only, which is
+the desk rule. Those seats are refused on state verbs, where the cron list
+still applies.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from pumpgrok.cli import EXIT_CONFIG, main
+from pumpgrok.tools.onchain.rpc import RpcClient, RpcError
 
 TICKET = "SOL-20260101-001"
 MINT = "So11111111111111111111111111111111111111112"
@@ -54,9 +61,11 @@ def _paper_verb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, side: str, seat
     return main(["paper", side, *TRADE_FLAGS, "--seat", seat])
 
 
-@pytest.mark.parametrize("side", ["buy", "sell"])
-@pytest.mark.parametrize("seat", ["sniper", "exit"])
-def test_forbidden_seats_refused_on_paper(
+@pytest.mark.parametrize(
+    ("side", "seat"),
+    [("buy", "exit"), ("sell", "sniper"), ("buy", "desk"), ("sell", "chief")],
+)
+def test_wrong_seat_refused_on_paper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -65,7 +74,9 @@ def test_forbidden_seats_refused_on_paper(
 ) -> None:
     code = _paper_verb(tmp_path, monkeypatch, side, seat)
     assert code == EXIT_CONFIG
-    assert "refused" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "refused" in captured.err
+    assert json.loads(captured.out)["code"] == "seat_may_trade"
 
 
 @pytest.mark.parametrize(
@@ -90,18 +101,27 @@ def test_forbidden_seats_refused_on_state(
     assert "refused" in capsys.readouterr().err
 
 
-def test_allowed_seat_refused_unavailable_on_paper(
+def test_sniper_buy_is_not_a_forbidden_owner_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # bot-04-sniper is not a forbidden owner and holds exec.simulate and exec.place, so the
-    # seat guard passes and the trade is refused as unavailable (exit 1). Operator seats
-    # (desk) keep permission_denied; see tests/test_tools_cli.py. No OrderPlaced is written.
-    code = _paper_verb(tmp_path, monkeypatch, "buy", "bot-04-sniper")
+    """The short name sniper passes the trade seat gate. No curve is mocked, so the
+    read fails closed and nothing is filled. The refusal is not seat_may_trade.
+    """
+
+    async def call(self: RpcClient, method: str, params: list[object]) -> object:
+        del self, params
+        if method == "getAccountInfo":
+            return {"context": {"slot": 1}, "value": None}
+        if method == "getRecentPrioritizationFees":
+            return [{"slot": 1, "prioritizationFee": 1}]
+        raise RpcError(f"unexpected method {method}")
+
+    monkeypatch.setattr(RpcClient, "call", call)
+    code = _paper_verb(tmp_path, monkeypatch, "buy", "sniper")
     assert code == EXIT_CONFIG
-    captured = capsys.readouterr()
-    payload = json.loads(captured.out)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] != "seat_may_trade"
     assert payload["ok"] is False
-    assert payload["code"] == "unavailable"
 
 
 def test_bad_ticket_is_usage_error(

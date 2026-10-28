@@ -58,6 +58,8 @@ async def _with_tools(
     settings: Settings,
     capabilities: Sequence[str],
     use: Callable[[list[Tool]], Awaitable[int]],
+    *,
+    bind_rpc_curve: bool = False,
 ) -> int:
     """Build the operator registry, resolve ``seat``, find every capability (I1).
 
@@ -73,6 +75,7 @@ async def _with_tools(
         settings=settings,
         ledger_path=PAPER_LEDGER_PATH,
         seed=settings.replay.seed,
+        bind_rpc_curve=bind_rpc_curve,
     )
     try:
         try:
@@ -104,9 +107,13 @@ def _run_wired(
     settings: Settings,
     capabilities: Sequence[str],
     use: Callable[[list[Tool]], Awaitable[int]],
+    *,
+    bind_rpc_curve: bool = False,
 ) -> int:
     """Run one wired verb: registry build, find (I1), then the verb tail."""
-    return asyncio.run(_with_tools(verb, seat, settings, capabilities, use))
+    return asyncio.run(
+        _with_tools(verb, seat, settings, capabilities, use, bind_rpc_curve=bind_rpc_curve)
+    )
 
 
 def _unflattened_lines(dumped: dict[str, Any]) -> list[str]:

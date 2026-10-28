@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["BASE_FEE_LAMPORTS", "COMPUTE_UNITS", "VENUE_FEE_BPS", "FeeModel"]
+__all__ = ["BASE_FEE_LAMPORTS", "COMPUTE_UNITS", "VENUE_FEE_BPS", "FeeModel", "take_fee"]
 
 #: pump.fun take in basis points (REVIEW).
 VENUE_FEE_BPS = 100
@@ -25,6 +25,12 @@ VENUE_FEE_BPS = 100
 BASE_FEE_LAMPORTS = 5_000
 #: Compute units per fill (REVIEW).
 COMPUTE_UNITS = 200_000
+
+
+def take_fee(default_bps: int, size_lamports: int, override_bps: int | None) -> int:
+    """Venue take. ``override_bps`` is the PumpSwap schedule when the fill is on a pool."""
+    bps = default_bps if override_bps is None else override_bps
+    return int(size_lamports) * int(bps) // 10_000
 
 
 @dataclass(frozen=True)
@@ -38,7 +44,7 @@ class FeeModel:
 
     def venue_fee(self, size_lamports: int) -> int:
         """Venue take on ``size_lamports`` (floored)."""
-        return size_lamports * self.venue_fee_bps // 10_000
+        return take_fee(self.venue_fee_bps, size_lamports, None)
 
     def priority_fee(self) -> int:
         """Priority cost for one transaction (floored)."""

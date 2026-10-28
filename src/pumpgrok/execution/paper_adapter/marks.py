@@ -6,17 +6,17 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 from pumpgrok.core.idempotency import canonical_json
+from pumpgrok.core.ids import Clock
 from pumpgrok.execution.curve_math import sell_out, spot
+from pumpgrok.execution.fees import FeeModel, take_fee
 from pumpgrok.execution.paper_adapter.models import CurveSnapshot, _ledger_mark_epoch
-from pumpgrok.ledger.reducer import PositionView
-from pumpgrok.ledger.store import LedgerInconsistent
+from pumpgrok.ledger.reducer import PositionView, initial_state, reduce
+from pumpgrok.ledger.store import LedgerInconsistent, LedgerStore
 from pumpgrok.replay.clock import format_ts_utc, parse_ts_utc
 from pumpgrok.risk.engine import SYSTEM_EXIT_REASONS
 
 if TYPE_CHECKING:
-    from pumpgrok.core.ids import Clock, IdFactory
-    from pumpgrok.execution.fees import FeeModel
-    from pumpgrok.ledger.store import LedgerStore
+    from pumpgrok.core.ids import IdFactory
     from pumpgrok.risk.limits import EngineLimits
 
 
@@ -113,10 +113,10 @@ class _MarksMixin:
         if pos is None or pos.token_units <= 0 or pos.mtm_frozen:
             return None
         curve = await self._read_curve(mint)
-        if curve is None or curve.complete:
+        if curve is None or curve.complete or curve.blind:
             return None
         gross = sell_out(curve.s_lamports, curve.t_units, pos.token_units)
-        venue = self._fees.venue_fee(gross)
+        venue = take_fee(self._fees.venue_fee_bps, gross, curve.fee_bps)
         mtm = gross - venue
         cash = int(state.cash_lamports)
         # Book value: this mint at the fresh mark, every other open position at
@@ -409,3 +409,66 @@ class _MarksMixin:
         self._frozen_marks[mint] = proceeds
         self._last_price_ts.pop(mint, None)
         return stored[1]
+
+
+def record_curve_mark(
+    store: LedgerStore,
+    clock: Clock,
+    *,
+    mint: str,
+    s_lamports: int,
+    t_units: int,
+    source: str = "paper",
+    correlation_id: str = "desk",
+) -> None:
+    """Append one curve mark when an open position has none.
+
+    A manual paper sell has to show the risk engine a fresh ``MarkToMarket``
+    or the sell is refused ``data_stale``. The supervisor writes marks on its
+    timer; this covers the CLI, which sells in a separate process. A position
+    that already has a mark is left alone.
+    """
+    if s_lamports <= 0 or t_units <= 0:
+        return
+    meta_equity = store.get_meta("initial_equity_lamports")
+    initial = int(meta_equity) if meta_equity is not None else 0
+    ts_utc = format_ts_utc(clock.now())
+    state = initial_state(source=source, initial_equity_lamports=initial, day_utc=ts_utc[:10])
+    for event in store.read(limit=None):
+        state = reduce(state, event)
+    pos = state.positions.get(mint)
+    if pos is None or pos.token_units <= 0 or pos.mtm_frozen or pos.last_mtm_ts_utc:
+        return
+    fees = FeeModel()
+    gross = sell_out(s_lamports, t_units, int(pos.token_units))
+    venue = fees.venue_fee(gross)
+    mtm = gross - venue
+    others = [p for key, p in state.positions.items() if key != mint and p.token_units > 0]
+    book_mtm = mtm + sum(int(p.last_mtm_lamports) for p in others)
+    book_basis = int(pos.cost_basis_lamports) + sum(int(p.cost_basis_lamports) for p in others)
+    prices_json = canonical_json(
+        {
+            mint: {
+                "mtm_lamports": mtm,
+                "venue_fee_lamports": venue,
+                "spot": str(spot(s_lamports, t_units)),
+                "source": "curve",
+                "ts_utc": ts_utc,
+            }
+        }
+    )
+    store.append(
+        ts_utc=ts_utc,
+        source=source,
+        correlation_id=correlation_id,
+        idempotency_key=f"mtm|{mint}|{ts_utc}",
+        type="MarkToMarket",
+        payload={
+            "source": source,
+            "ts_source": ts_utc,
+            "cash_lamports": int(state.cash_lamports),
+            "equity_lamports": int(state.cash_lamports) + book_mtm,
+            "unrealized_lamports": book_mtm - book_basis,
+            "prices_json": prices_json,
+        },
+    )
